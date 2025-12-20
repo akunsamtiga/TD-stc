@@ -1,40 +1,9 @@
-import admin from 'firebase-admin';
+import axios from 'axios';
 import { readFileSync } from 'fs';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
-import dns from 'dns';
-import { promisify } from 'util';
 
 dotenv.config();
-
-// ============================================
-// DNS FIX untuk Windows/Node.js
-// ============================================
-// Force IPv4 first (fix untuk ENOTFOUND error)
-dns.setDefaultResultOrder('ipv4first');
-
-// Set Google DNS & Cloudflare DNS
-dns.setServers([
-  '8.8.8.8',      // Google Primary
-  '8.8.4.4',      // Google Secondary
-  '1.1.1.1',      // Cloudflare Primary
-  '1.0.0.1'       // Cloudflare Secondary
-]);
-
-// Test DNS resolution
-const dnsResolve = promisify(dns.resolve4);
-async function testDNS() {
-  try {
-    const addresses = await dnsResolve('accounts.google.com');
-    console.log('✅ DNS Resolution Test: SUCCESS');
-    console.log(`   Resolved accounts.google.com → ${addresses[0]}`);
-    return true;
-  } catch (error) {
-    console.error('❌ DNS Resolution Test: FAILED');
-    console.error(`   Error: ${error.message}`);
-    return false;
-  }
-}
 
 // ============================================
 // LOGGER CONFIGURATION
@@ -61,6 +30,95 @@ const logger = createLogger({
 });
 
 // ============================================
+// FIREBASE REST API CLIENT (AXIOS)
+// ============================================
+class FirebaseRestClient {
+  constructor(databaseURL) {
+    this.databaseURL = databaseURL.replace(/\/$/, '');
+    
+    // Create axios instance with custom config
+    this.client = axios.create({
+      baseURL: this.databaseURL,
+      timeout: 8000, // 8 second timeout
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      // Retry configuration
+      validateStatus: (status) => status >= 200 && status < 300
+    });
+    
+    // Add request interceptor for logging
+    this.client.interceptors.request.use(
+      (config) => {
+        logger.debug(`→ ${config.method.toUpperCase()} ${config.url}`);
+        return config;
+      },
+      (error) => {
+        logger.error(`Request interceptor error: ${error.message}`);
+        return Promise.reject(error);
+      }
+    );
+    
+    // Add response interceptor
+    this.client.interceptors.response.use(
+      (response) => {
+        logger.debug(`← ${response.status} ${response.config.url}`);
+        return response;
+      },
+      (error) => {
+        if (error.response) {
+          logger.error(`Response error: ${error.response.status} - ${error.response.statusText}`);
+        } else if (error.request) {
+          logger.error(`Request timeout or network error: ${error.message}`);
+        } else {
+          logger.error(`Error: ${error.message}`);
+        }
+        return Promise.reject(error);
+      }
+    );
+  }
+
+  async set(path, data) {
+    try {
+      const response = await this.client.put(`${path}.json`, data);
+      return response.data;
+    } catch (error) {
+      throw new Error(`Firebase set error: ${error.message}`);
+    }
+  }
+
+  async get(path) {
+    try {
+      const response = await this.client.get(`${path}.json`);
+      return response.data;
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        return null; // Path doesn't exist
+      }
+      throw new Error(`Firebase get error: ${error.message}`);
+    }
+  }
+
+  async update(path, data) {
+    try {
+      const response = await this.client.patch(`${path}.json`, data);
+      return response.data;
+    } catch (error) {
+      throw new Error(`Firebase update error: ${error.message}`);
+    }
+  }
+
+  async delete(path) {
+    try {
+      const response = await this.client.delete(`${path}.json`);
+      return response.data;
+    } catch (error) {
+      throw new Error(`Firebase delete error: ${error.message}`);
+    }
+  }
+}
+
+// ============================================
 // IDX_STC SIMULATOR CLASS
 // ============================================
 class IDXSTCSimulator {
@@ -70,73 +128,53 @@ class IDXSTCSimulator {
     this.assetName = config.assetName;
     this.timezone = config.timezone;
     
-    // Volatility settings
     this.dailyVolatilityMin = parseFloat(config.dailyVolatilityMin);
     this.dailyVolatilityMax = parseFloat(config.dailyVolatilityMax);
     this.secondVolatilityMin = parseFloat(config.secondVolatilityMin);
     this.secondVolatilityMax = parseFloat(config.secondVolatilityMax);
     
-    // Data retention
     this.dataRetentionDays = parseInt(config.dataRetentionDays);
     this.cleanupIntervalHours = parseInt(config.cleanupIntervalHours);
     
-    // State tracking
     this.lastDirection = 1;
     this.iteration = 0;
     this.lastCleanup = Date.now();
+    this.consecutiveErrors = 0;
+    this.maxConsecutiveErrors = 10;
     
     logger.info(`${this.assetName} Simulator initialized`);
     logger.info(`Initial Price: ${this.initialPrice}`);
     logger.info(`Timezone: ${this.timezone}`);
   }
 
-  async initializeFirebase(credsPath, databaseURL) {
+  async initializeFirebase(databaseURL) {
     try {
-      logger.info('🔍 Testing DNS resolution...');
-      const dnsOk = await testDNS();
+      logger.info('🔌 Initializing Firebase REST API Client (Axios)...');
+      this.firebase = new FirebaseRestClient(databaseURL);
       
-      if (!dnsOk) {
-        logger.warn('⚠️  DNS test failed, but continuing...');
-      }
-
-      logger.info('📥 Loading Firebase credentials...');
-      const serviceAccount = JSON.parse(readFileSync(credsPath, 'utf8'));
-      
-      logger.info('🔐 Initializing Firebase Admin SDK...');
-      
-      // Initialize with extended timeout and retry options
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL: databaseURL,
-        httpAgent: undefined, // Let SDK use default agent
-      });
-      
-      this.db = admin.database();
-      this.ohlcRef = this.db.ref(`/${this.assetName.toLowerCase()}/ohlc`);
-      this.currentPriceRef = this.db.ref(`/${this.assetName.toLowerCase()}/current_price`);
-      this.statsRef = this.db.ref(`/${this.assetName.toLowerCase()}/stats`);
+      const assetPath = `/${this.assetName.toLowerCase()}`;
+      this.ohlcPath = `${assetPath}/ohlc`;
+      this.currentPricePath = `${assetPath}/current_price`;
+      this.statsPath = `${assetPath}/stats`;
       
       // Test connection
       logger.info('🔌 Testing Firebase connection...');
-      await this.currentPriceRef.once('value');
+      logger.info(`   Database URL: ${databaseURL}`);
       
-      logger.info('✅ Firebase initialized successfully');
+      const testData = { 
+        test: 'connection_test', 
+        timestamp: Date.now(),
+        version: '2.0-axios'
+      };
+      
+      await this.firebase.set('/test', testData);
+      
+      logger.info('✅ Firebase connection successful!');
+      logger.info('✅ Firebase REST API initialized (Axios mode)');
       return true;
+      
     } catch (error) {
       logger.error(`❌ Firebase initialization error: ${error.message}`);
-      logger.error(`   Error code: ${error.code || 'unknown'}`);
-      
-      if (error.message.includes('ENOTFOUND') || error.message.includes('getaddrinfo')) {
-        logger.error('');
-        logger.error('💡 DNS Resolution Issue Detected!');
-        logger.error('   Possible solutions:');
-        logger.error('   1. Run in Command Prompt (not Git Bash)');
-        logger.error('   2. Disable VPN/Proxy temporarily');
-        logger.error('   3. Check Windows Firewall settings');
-        logger.error('   4. Restart your computer');
-        logger.error('');
-      }
-      
       throw error;
     }
   }
@@ -164,24 +202,20 @@ class IDXSTCSimulator {
   }
 
   generatePriceMovement() {
-    // Random walk with momentum
     const volatility = this.secondVolatilityMin + 
       Math.random() * (this.secondVolatilityMax - this.secondVolatilityMin);
     
     let direction = Math.random() < 0.5 ? -1 : 1;
     
-    // 70% chance to continue previous direction (momentum)
     if (Math.random() < 0.7) {
       direction = this.lastDirection;
     }
     
     this.lastDirection = direction;
     
-    // Calculate price change
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // Price bounds (50% - 200% of initial)
     const minPrice = this.initialPrice * 0.5;
     const maxPrice = this.initialPrice * 2.0;
     
@@ -194,7 +228,6 @@ class IDXSTCSimulator {
   generateOHLCBar(timestamp) {
     const openPrice = this.currentPrice;
     
-    // Generate 4 price points for realistic OHLC
     const prices = [openPrice];
     for (let i = 0; i < 3; i++) {
       prices.push(this.generatePriceMovement());
@@ -204,13 +237,10 @@ class IDXSTCSimulator {
     const highPrice = Math.max(...prices);
     const lowPrice = Math.min(...prices);
     
-    // Update current price
     this.currentPrice = closePrice;
     
-    // Generate volume
     const volume = Math.floor(1000 + Math.random() * 49000);
     
-    // Format datetime
     const date = new Date(timestamp);
     const { datetime, iso } = this.formatDateTime(date);
     
@@ -232,12 +262,12 @@ class IDXSTCSimulator {
       const timestampKey = ohlcData.timestamp.toString();
       
       // Save OHLC data
-      await this.ohlcRef.child(timestampKey).set(ohlcData);
+      await this.firebase.set(`${this.ohlcPath}/${timestampKey}`, ohlcData);
       
       // Update current price
       const priceChange = ((ohlcData.close - this.initialPrice) / this.initialPrice) * 100;
       
-      await this.currentPriceRef.set({
+      await this.firebase.set(this.currentPricePath, {
         price: ohlcData.close,
         timestamp: ohlcData.timestamp,
         datetime: ohlcData.datetime,
@@ -256,15 +286,23 @@ class IDXSTCSimulator {
         `V:${ohlcData.volume}`
       );
       
+      // Reset error counter on success
+      this.consecutiveErrors = 0;
+      
     } catch (error) {
-      logger.error(`Error saving to Firebase: ${error.message}`);
+      this.consecutiveErrors++;
+      logger.error(`Error saving to Firebase (${this.consecutiveErrors}/${this.maxConsecutiveErrors}): ${error.message}`);
+      
+      if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+        logger.error(`❌ Too many consecutive errors (${this.consecutiveErrors}). Exiting...`);
+        process.exit(1);
+      }
     }
   }
 
   async updateStats(ohlcData) {
     try {
-      const snapshot = await this.statsRef.once('value');
-      const currentStats = snapshot.val() || {};
+      const currentStats = await this.firebase.get(this.statsPath) || {};
       
       const stats = {
         total_bars: (currentStats.total_bars || 0) + 1,
@@ -284,7 +322,7 @@ class IDXSTCSimulator {
         total_volume: (currentStats.total_volume || 0) + ohlcData.volume
       };
       
-      await this.statsRef.set(stats);
+      await this.firebase.set(this.statsPath, stats);
       
     } catch (error) {
       logger.error(`Error updating stats: ${error.message}`);
@@ -293,26 +331,31 @@ class IDXSTCSimulator {
 
   async cleanupOldData() {
     try {
+      logger.info('🗑️  Starting data cleanup...');
+      
       const currentTime = Math.floor(Date.now() / 1000);
       const cutoffTime = currentTime - (this.dataRetentionDays * 24 * 60 * 60);
       
-      const snapshot = await this.ohlcRef.once('value');
-      const allData = snapshot.val() || {};
+      const allData = await this.firebase.get(this.ohlcPath) || {};
       
       let deletedCount = 0;
       const deletePromises = [];
       
       for (const timestampKey in allData) {
         if (parseInt(timestampKey) < cutoffTime) {
-          deletePromises.push(this.ohlcRef.child(timestampKey).remove());
+          deletePromises.push(
+            this.firebase.delete(`${this.ohlcPath}/${timestampKey}`)
+              .catch(err => logger.error(`Error deleting ${timestampKey}: ${err.message}`))
+          );
           deletedCount++;
         }
       }
       
-      await Promise.all(deletePromises);
-      
-      if (deletedCount > 0) {
+      if (deletePromises.length > 0) {
+        await Promise.all(deletePromises);
         logger.info(`🗑️  Cleaned up ${deletedCount} old records`);
+      } else {
+        logger.info('🗑️  No old records to clean up');
       }
       
     } catch (error) {
@@ -325,7 +368,6 @@ class IDXSTCSimulator {
     logger.info(`📍 Timezone: ${this.timezone}`);
     logger.info('⏱️  Synchronizing with system clock...');
     
-    // Wait for next second boundary
     await this.waitForNextSecond();
     
     const startTime = this.getCurrentTime();
@@ -334,37 +376,34 @@ class IDXSTCSimulator {
     
     const cleanupIntervalMs = this.cleanupIntervalHours * 60 * 60 * 1000;
     
-    // Main loop
     const runLoop = async () => {
       try {
         const timestamp = Date.now();
         const startProcess = Date.now();
         
-        // Generate and save OHLC
         const ohlcData = this.generateOHLCBar(timestamp);
         await this.saveToFirebase(ohlcData);
         
         const processTime = (Date.now() - startProcess) / 1000;
         this.iteration++;
         
-        // Warning if processing too slow
         if (processTime > 0.5) {
           logger.warn(`⚠️  Processing took ${processTime.toFixed(3)}s - may affect precision`);
         }
         
-        // Periodic cleanup
         if (Date.now() - this.lastCleanup > cleanupIntervalMs) {
           await this.cleanupOldData();
           this.lastCleanup = Date.now();
         }
         
-        // Wait for next second
         await this.waitForNextSecond();
         runLoop();
         
       } catch (error) {
         logger.error(`Simulator error: ${error.message}`);
-        process.exit(1);
+        logger.info('Continuing after error...');
+        await this.waitForNextSecond();
+        runLoop();
       }
     };
     
@@ -374,7 +413,6 @@ class IDXSTCSimulator {
   async stop() {
     logger.info('\n⏹️  Simulator stopped by user');
     logger.info(`📊 Total iterations: ${this.iteration}`);
-    await admin.app().delete();
     process.exit(0);
   }
 }
@@ -388,6 +426,7 @@ async function main() {
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Platform: ${process.platform}`);
   console.log(`   Architecture: ${process.arch}`);
+  console.log(`   Mode: REST API (Axios)`);
   console.log('');
 
   const config = {
@@ -404,18 +443,14 @@ async function main() {
 
   const simulator = new IDXSTCSimulator(config);
   
-  // Handle graceful shutdown
   process.on('SIGINT', () => simulator.stop());
   process.on('SIGTERM', () => simulator.stop());
   
   try {
-    // Initialize Firebase
     await simulator.initializeFirebase(
-      'firebase_credentials.json',
       process.env.FIREBASE_DATABASE_URL
     );
     
-    // Run simulator
     await simulator.run();
     
   } catch (error) {
