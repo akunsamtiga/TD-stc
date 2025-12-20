@@ -1,0 +1,25 @@
+{
+  "name": "idx-stc-trading-simulator",
+  "version": "1.0.0",
+  "description": "Real-time trading price simulator with Firebase",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "firebase-admin": "^13.6.0",
+    "winston": "^3.11.0"
+  },
+  "keywords": [
+    "trading",
+    "simulator",
+    "firebase",
+    "ohlc"
+  ],
+  "author": "",
+  "license": "MIT"
+}
