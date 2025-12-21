@@ -6,7 +6,7 @@ import { createLogger, format, transports } from 'winston';
 dotenv.config();
 
 // ============================================
-// LOGGER CONFIGURATION
+// LOGGER CONFIGURATION (WITH ROTATION)
 // ============================================
 const logger = createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -17,7 +17,12 @@ const logger = createLogger({
     })
   ),
   transports: [
-    new transports.File({ filename: 'simulator.log' }),
+    new transports.File({ 
+      filename: 'simulator.log',
+      maxsize: 5242880, // 5MB
+      maxFiles: 3,
+      tailable: true
+    }),
     new transports.Console({
       format: format.combine(
         format.colorize(),
@@ -30,24 +35,27 @@ const logger = createLogger({
 });
 
 // ============================================
-// FIREBASE REST API CLIENT (AXIOS)
+// FIREBASE REST API CLIENT (OPTIMIZED)
 // ============================================
 class FirebaseRestClient {
   constructor(databaseURL) {
     this.databaseURL = databaseURL.replace(/\/$/, '');
     
-    // Create axios instance with custom config
+    // Create axios instance with optimized config
     this.client = axios.create({
       baseURL: this.databaseURL,
-      timeout: 8000, // 8 second timeout
+      timeout: 15000, // Reduced to 15s
+      family: 4,
       headers: {
         'Content-Type': 'application/json'
       },
-      // Retry configuration
-      validateStatus: (status) => status >= 200 && status < 300
+      validateStatus: (status) => status >= 200 && status < 300,
+      maxRedirects: 5,
+      // Important: prevent keep-alive issues
+      httpAgent: null,
+      httpsAgent: null
     });
     
-    // Add request interceptor for logging
     this.client.interceptors.request.use(
       (config) => {
         logger.debug(`→ ${config.method.toUpperCase()} ${config.url}`);
@@ -59,7 +67,6 @@ class FirebaseRestClient {
       }
     );
     
-    // Add response interceptor
     this.client.interceptors.response.use(
       (response) => {
         logger.debug(`← ${response.status} ${response.config.url}`);
@@ -69,7 +76,7 @@ class FirebaseRestClient {
         if (error.response) {
           logger.error(`Response error: ${error.response.status} - ${error.response.statusText}`);
         } else if (error.request) {
-          logger.error(`Request timeout or network error: ${error.message}`);
+          logger.error(`Network error: ${error.message}`);
         } else {
           logger.error(`Error: ${error.message}`);
         }
@@ -93,7 +100,7 @@ class FirebaseRestClient {
       return response.data;
     } catch (error) {
       if (error.response && error.response.status === 404) {
-        return null; // Path doesn't exist
+        return null;
       }
       throw new Error(`Firebase get error: ${error.message}`);
     }
@@ -116,10 +123,25 @@ class FirebaseRestClient {
       throw new Error(`Firebase delete error: ${error.message}`);
     }
   }
+
+  // Batch delete for optimization
+  async batchDelete(paths) {
+    const updates = {};
+    paths.forEach(path => {
+      updates[path] = null;
+    });
+    
+    try {
+      const response = await this.client.patch('/.json', updates);
+      return response.data;
+    } catch (error) {
+      throw new Error(`Firebase batch delete error: ${error.message}`);
+    }
+  }
 }
 
 // ============================================
-// IDX_STC SIMULATOR CLASS
+// IDX_STC SIMULATOR CLASS (OPTIMIZED)
 // ============================================
 class IDXSTCSimulator {
   constructor(config) {
@@ -141,6 +163,14 @@ class IDXSTCSimulator {
     this.lastCleanup = Date.now();
     this.consecutiveErrors = 0;
     this.maxConsecutiveErrors = 10;
+    
+    // Add memory monitoring
+    this.lastMemoryCheck = Date.now();
+    this.memoryCheckInterval = 60000; // 1 minute
+    
+    // Control flag for graceful shutdown
+    this.isRunning = false;
+    this.intervalId = null;
     
     logger.info(`${this.assetName} Simulator initialized`);
     logger.info(`Initial Price: ${this.initialPrice}`);
@@ -164,13 +194,13 @@ class IDXSTCSimulator {
       const testData = { 
         test: 'connection_test', 
         timestamp: Date.now(),
-        version: '2.0-axios'
+        version: '2.1-optimized'
       };
       
       await this.firebase.set('/test', testData);
       
       logger.info('✅ Firebase connection successful!');
-      logger.info('✅ Firebase REST API initialized (Axios mode)');
+      logger.info('✅ Firebase REST API initialized (Optimized mode)');
       return true;
       
     } catch (error) {
@@ -190,15 +220,6 @@ class IDXSTCSimulator {
       datetime: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`,
       iso: date.toISOString()
     };
-  }
-
-  async waitForNextSecond() {
-    const now = Date.now();
-    const msToNextSecond = 1000 - (now % 1000);
-    
-    return new Promise(resolve => {
-      setTimeout(() => resolve(Date.now()), msToNextSecond);
-    });
   }
 
   generatePriceMovement() {
@@ -261,23 +282,24 @@ class IDXSTCSimulator {
     try {
       const timestampKey = ohlcData.timestamp.toString();
       
-      // Save OHLC data
-      await this.firebase.set(`${this.ohlcPath}/${timestampKey}`, ohlcData);
-      
-      // Update current price
-      const priceChange = ((ohlcData.close - this.initialPrice) / this.initialPrice) * 100;
-      
-      await this.firebase.set(this.currentPricePath, {
-        price: ohlcData.close,
-        timestamp: ohlcData.timestamp,
-        datetime: ohlcData.datetime,
-        datetime_iso: ohlcData.datetime_iso,
-        timezone: ohlcData.timezone,
-        change: parseFloat(priceChange.toFixed(2))
-      });
-      
-      // Update statistics
-      await this.updateStats(ohlcData);
+      // Parallel execution for better performance
+      await Promise.all([
+        // Save OHLC data
+        this.firebase.set(`${this.ohlcPath}/${timestampKey}`, ohlcData),
+        
+        // Update current price
+        this.firebase.set(this.currentPricePath, {
+          price: ohlcData.close,
+          timestamp: ohlcData.timestamp,
+          datetime: ohlcData.datetime,
+          datetime_iso: ohlcData.datetime_iso,
+          timezone: ohlcData.timezone,
+          change: parseFloat(((ohlcData.close - this.initialPrice) / this.initialPrice * 100).toFixed(2))
+        }),
+        
+        // Update statistics
+        this.updateStats(ohlcData)
+      ]);
       
       logger.info(
         `[${ohlcData.datetime}] OHLC - ` +
@@ -294,9 +316,11 @@ class IDXSTCSimulator {
       logger.error(`Error saving to Firebase (${this.consecutiveErrors}/${this.maxConsecutiveErrors}): ${error.message}`);
       
       if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
-        logger.error(`❌ Too many consecutive errors (${this.consecutiveErrors}). Exiting...`);
-        process.exit(1);
+        logger.error(`❌ Too many consecutive errors (${this.consecutiveErrors}). Stopping...`);
+        await this.stop();
       }
+      
+      throw error; // Re-throw to trigger retry mechanism
     }
   }
 
@@ -338,22 +362,18 @@ class IDXSTCSimulator {
       
       const allData = await this.firebase.get(this.ohlcPath) || {};
       
-      let deletedCount = 0;
-      const deletePromises = [];
+      const pathsToDelete = [];
       
       for (const timestampKey in allData) {
         if (parseInt(timestampKey) < cutoffTime) {
-          deletePromises.push(
-            this.firebase.delete(`${this.ohlcPath}/${timestampKey}`)
-              .catch(err => logger.error(`Error deleting ${timestampKey}: ${err.message}`))
-          );
-          deletedCount++;
+          pathsToDelete.push(`${this.ohlcPath}/${timestampKey}`);
         }
       }
       
-      if (deletePromises.length > 0) {
-        await Promise.all(deletePromises);
-        logger.info(`🗑️  Cleaned up ${deletedCount} old records`);
+      if (pathsToDelete.length > 0) {
+        // Use batch delete for better performance
+        await this.firebase.batchDelete(pathsToDelete);
+        logger.info(`🗑️  Cleaned up ${pathsToDelete.length} old records`);
       } else {
         logger.info('🗑️  No old records to clean up');
       }
@@ -363,57 +383,97 @@ class IDXSTCSimulator {
     }
   }
 
+  checkMemoryUsage() {
+    const used = process.memoryUsage();
+    const mbUsed = (used.heapUsed / 1024 / 1024).toFixed(2);
+    const mbTotal = (used.heapTotal / 1024 / 1024).toFixed(2);
+    
+    logger.info(`💾 Memory: ${mbUsed}MB / ${mbTotal}MB heap`);
+    
+    // Alert if memory usage is high
+    if (used.heapUsed / used.heapTotal > 0.9) {
+      logger.warn(`⚠️  High memory usage detected! Consider restarting.`);
+    }
+  }
+
+  async processIteration() {
+    if (!this.isRunning) return;
+    
+    try {
+      const timestamp = Date.now();
+      const startProcess = Date.now();
+      
+      const ohlcData = this.generateOHLCBar(timestamp);
+      await this.saveToFirebase(ohlcData);
+      
+      const processTime = (Date.now() - startProcess) / 1000;
+      this.iteration++;
+      
+      if (processTime > 0.5) {
+        logger.warn(`⚠️  Processing took ${processTime.toFixed(3)}s - may affect precision`);
+      }
+      
+      // Periodic cleanup
+      const cleanupIntervalMs = this.cleanupIntervalHours * 60 * 60 * 1000;
+      if (Date.now() - this.lastCleanup > cleanupIntervalMs) {
+        await this.cleanupOldData();
+        this.lastCleanup = Date.now();
+      }
+      
+      // Periodic memory check
+      if (Date.now() - this.lastMemoryCheck > this.memoryCheckInterval) {
+        this.checkMemoryUsage();
+        this.lastMemoryCheck = Date.now();
+      }
+      
+    } catch (error) {
+      logger.error(`Iteration error: ${error.message}`);
+      
+      // Don't stop on single error, but wait before retry
+      if (this.consecutiveErrors < this.maxConsecutiveErrors) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
   async run() {
     logger.info(`🚀 Starting ${this.assetName} simulator...`);
     logger.info(`📍 Timezone: ${this.timezone}`);
-    logger.info('⏱️  Synchronizing with system clock...');
+    logger.info('⏱️  Starting with interval-based execution...');
     
-    await this.waitForNextSecond();
+    this.isRunning = true;
     
     const startTime = this.getCurrentTime();
-    logger.info(`✅ Synchronized! Starting at ${this.formatDateTime(startTime).datetime}`);
+    logger.info(`✅ Started at ${this.formatDateTime(startTime).datetime}`);
     logger.info('Press Ctrl+C to stop\n');
     
-    const cleanupIntervalMs = this.cleanupIntervalHours * 60 * 60 * 1000;
+    // Use setInterval instead of recursion to prevent stack overflow
+    this.intervalId = setInterval(() => {
+      this.processIteration();
+    }, 1000); // Run every second
     
-    const runLoop = async () => {
-      try {
-        const timestamp = Date.now();
-        const startProcess = Date.now();
-        
-        const ohlcData = this.generateOHLCBar(timestamp);
-        await this.saveToFirebase(ohlcData);
-        
-        const processTime = (Date.now() - startProcess) / 1000;
-        this.iteration++;
-        
-        if (processTime > 0.5) {
-          logger.warn(`⚠️  Processing took ${processTime.toFixed(3)}s - may affect precision`);
-        }
-        
-        if (Date.now() - this.lastCleanup > cleanupIntervalMs) {
-          await this.cleanupOldData();
-          this.lastCleanup = Date.now();
-        }
-        
-        await this.waitForNextSecond();
-        runLoop();
-        
-      } catch (error) {
-        logger.error(`Simulator error: ${error.message}`);
-        logger.info('Continuing after error...');
-        await this.waitForNextSecond();
-        runLoop();
-      }
-    };
-    
-    runLoop();
+    // Initial check
+    this.checkMemoryUsage();
   }
 
   async stop() {
-    logger.info('\n⏹️  Simulator stopped by user');
+    if (!this.isRunning) return;
+    
+    logger.info('\n⏹️  Stopping simulator...');
+    this.isRunning = false;
+    
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+    
     logger.info(`📊 Total iterations: ${this.iteration}`);
-    process.exit(0);
+    logger.info('✅ Simulator stopped gracefully');
+    
+    // Give time for final logs to flush
+    setTimeout(() => {
+      process.exit(0);
+    }, 500);
   }
 }
 
@@ -426,7 +486,7 @@ async function main() {
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Platform: ${process.platform}`);
   console.log(`   Architecture: ${process.arch}`);
-  console.log(`   Mode: REST API (Axios)`);
+  console.log(`   Mode: REST API (Optimized)`);
   console.log('');
 
   const config = {
@@ -443,8 +503,22 @@ async function main() {
 
   const simulator = new IDXSTCSimulator(config);
   
+  // Graceful shutdown handlers
   process.on('SIGINT', () => simulator.stop());
   process.on('SIGTERM', () => simulator.stop());
+  process.on('SIGUSR2', () => simulator.stop()); // PM2 reload
+  
+  // Handle uncaught errors
+  process.on('uncaughtException', (error) => {
+    logger.error(`Uncaught Exception: ${error.message}`);
+    logger.error(error.stack);
+    simulator.stop();
+  });
+  
+  process.on('unhandledRejection', (reason, promise) => {
+    logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+    simulator.stop();
+  });
   
   try {
     await simulator.initializeFirebase(
@@ -455,6 +529,7 @@ async function main() {
     
   } catch (error) {
     logger.error(`❌ Fatal error: ${error.message}`);
+    logger.error(error.stack);
     process.exit(1);
   }
 }

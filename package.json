@@ -1,13 +1,18 @@
 {
   "name": "idx-stc-trading-simulator",
-  "version": "1.0.0",
-  "description": "Real-time trading price simulator with Firebase",
+  "version": "2.1.0",
+  "description": "Optimized real-time trading price simulator with Firebase",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop idx-stc-simulator",
+    "pm2:restart": "pm2 restart idx-stc-simulator",
+    "pm2:logs": "pm2 logs idx-stc-simulator",
+    "pm2:monit": "pm2 monit"
   },
   "dependencies": {
     "axios": "^1.13.2",
@@ -18,8 +23,12 @@
     "trading",
     "simulator",
     "firebase",
-    "ohlc"
+    "ohlc",
+    "optimized"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
