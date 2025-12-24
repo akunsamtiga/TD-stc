@@ -1,5 +1,9 @@
+// ============================================
+// FIXED IDX_STC MULTI-TIMEFRAME SIMULATOR
+// Version: 2.0 - Complete OHLC Generation
+// ============================================
+
 import axios from 'axios';
-import { readFileSync } from 'fs';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
 
@@ -19,7 +23,7 @@ const logger = createLogger({
   transports: [
     new transports.File({ 
       filename: 'simulator.log',
-      maxsize: 5242880,
+      maxsize: 5242880, // 5MB
       maxFiles: 3,
       tailable: true
     }),
@@ -44,14 +48,12 @@ class FirebaseRestClient {
     this.client = axios.create({
       baseURL: this.databaseURL,
       timeout: 15000,
-      family: 4,
+      family: 4, // Force IPv4
       headers: {
         'Content-Type': 'application/json'
       },
       validateStatus: (status) => status >= 200 && status < 300,
       maxRedirects: 5,
-      httpAgent: null,
-      httpsAgent: null
     });
   }
 
@@ -73,18 +75,27 @@ class FirebaseRestClient {
     }
   }
 
-  async batchUpdate(updates) {
+  async get(path) {
     try {
-      const response = await this.client.patch('/.json', updates);
+      const response = await this.client.get(`${path}.json`);
       return response.data;
     } catch (error) {
-      throw new Error(`Firebase batch update error: ${error.message}`);
+      throw new Error(`Firebase get error: ${error.message}`);
+    }
+  }
+
+  async delete(path) {
+    try {
+      const response = await this.client.delete(`${path}.json`);
+      return response.data;
+    } catch (error) {
+      throw new Error(`Firebase delete error: ${error.message}`);
     }
   }
 }
 
 // ============================================
-// TIMEFRAME MANAGER
+// TIMEFRAME MANAGER (FIXED VERSION)
 // ============================================
 class TimeframeManager {
   constructor() {
@@ -106,30 +117,41 @@ class TimeframeManager {
     Object.keys(this.timeframes).forEach(tf => {
       this.bars[tf] = null;
     });
+
+    // Statistics
+    this.barsCreated = {};
+    Object.keys(this.timeframes).forEach(tf => {
+      this.barsCreated[tf] = 0;
+    });
   }
 
-  // Check if timestamp is at the boundary of a timeframe
-  isTimeframeBoundary(timestamp, timeframeSeconds) {
-    return timestamp % timeframeSeconds === 0;
-  }
-
-  // Get the timeframe bar timestamp (floor to boundary)
+  /**
+   * Get the bar timestamp (floor to boundary)
+   */
   getBarTimestamp(timestamp, timeframeSeconds) {
     return Math.floor(timestamp / timeframeSeconds) * timeframeSeconds;
   }
 
-  // Update OHLC for a price tick
-  updateOHLC(timestamp, price, volume = 0) {
-    const updates = {};
+  /**
+   * Update OHLC for a price tick
+   * Returns: { completed: [...], current: [...] }
+   */
+  updateOHLC(timestamp, price) {
+    const completedBars = {};
+    const currentBars = {};
 
     Object.entries(this.timeframes).forEach(([tf, seconds]) => {
       const barTimestamp = this.getBarTimestamp(timestamp, seconds);
 
-      // If this is a new bar or first bar
+      // Check if we need a new bar
       if (!this.bars[tf] || this.bars[tf].timestamp !== barTimestamp) {
-        // Finalize previous bar if exists
+        // Save completed bar
         if (this.bars[tf]) {
-          updates[tf] = { ...this.bars[tf], isClosed: true };
+          completedBars[tf] = {
+            ...this.bars[tf],
+            isCompleted: true
+          };
+          this.barsCreated[tf]++;
         }
 
         // Start new bar
@@ -139,35 +161,40 @@ class TimeframeManager {
           high: price,
           low: price,
           close: price,
-          volume: volume,
-          isClosed: false
+          volume: 0,
+          isCompleted: false
         };
       } else {
         // Update existing bar
         this.bars[tf].high = Math.max(this.bars[tf].high, price);
         this.bars[tf].low = Math.min(this.bars[tf].low, price);
         this.bars[tf].close = price;
-        this.bars[tf].volume += volume;
       }
+      
+      // Add volume
+      this.bars[tf].volume += Math.floor(1000 + Math.random() * 49000);
+
+      // Always include current bar
+      currentBars[tf] = { ...this.bars[tf] };
     });
 
-    return updates;
+    return { completedBars, currentBars };
   }
 
-  // Get current bars (for saving)
-  getCurrentBars() {
-    const current = {};
-    Object.entries(this.bars).forEach(([tf, bar]) => {
-      if (bar) {
-        current[tf] = { ...bar };
-      }
-    });
-    return current;
+  /**
+   * Get statistics
+   */
+  getStatistics() {
+    return {
+      timeframes: Object.keys(this.timeframes),
+      barsCreated: this.barsCreated,
+      currentBars: Object.keys(this.bars).filter(tf => this.bars[tf] !== null)
+    };
   }
 }
 
 // ============================================
-// MULTI-TIMEFRAME SIMULATOR
+// MULTI-TIMEFRAME SIMULATOR (FIXED VERSION)
 // ============================================
 class MultiTimeframeSimulator {
   constructor(config) {
@@ -176,12 +203,8 @@ class MultiTimeframeSimulator {
     this.assetName = config.assetName;
     this.timezone = config.timezone;
     
-    this.dailyVolatilityMin = parseFloat(config.dailyVolatilityMin);
-    this.dailyVolatilityMax = parseFloat(config.dailyVolatilityMax);
-    this.secondVolatilityMin = parseFloat(config.secondVolatilityMin);
-    this.secondVolatilityMax = parseFloat(config.secondVolatilityMax);
-    
-    this.dataRetentionDays = parseInt(config.dataRetentionDays);
+    this.volatilityMin = parseFloat(config.secondVolatilityMin);
+    this.volatilityMax = parseFloat(config.secondVolatilityMax);
     
     this.lastDirection = 1;
     this.iteration = 0;
@@ -194,7 +217,16 @@ class MultiTimeframeSimulator {
     // Initialize timeframe manager
     this.tfManager = new TimeframeManager();
     
-    logger.info(`${this.assetName} Multi-Timeframe Simulator initialized`);
+    // Statistics
+    this.stats = {
+      totalIterations: 0,
+      totalWrites: 0,
+      totalErrors: 0,
+      startTime: null,
+      lastWriteTime: null
+    };
+    
+    logger.info(`${this.assetName} Multi-Timeframe Simulator v2.0 initialized`);
     logger.info(`Timeframes: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
   }
 
@@ -209,14 +241,14 @@ class MultiTimeframeSimulator {
       this.statsPath = `${assetPath}/stats`;
       
       // Test connection
-      await this.firebase.set('/test', { 
-        test: 'connection_test', 
+      await this.firebase.set('/test_connection', { 
+        test: 'simulator_v2',
         timestamp: Date.now(),
-        version: '3.0-multi-timeframe'
+        version: '2.0-fixed'
       });
       
       logger.info('✅ Firebase connection successful!');
-      logger.info('✅ Multi-timeframe mode enabled');
+      logger.info('✅ Multi-timeframe OHLC generation enabled');
       return true;
       
     } catch (error) {
@@ -225,21 +257,24 @@ class MultiTimeframeSimulator {
     }
   }
 
+  /**
+   * Generate next price with random walk
+   */
   generatePriceMovement() {
-    const volatility = this.secondVolatilityMin + 
-      Math.random() * (this.secondVolatilityMax - this.secondVolatilityMin);
+    const volatility = this.volatilityMin + 
+      Math.random() * (this.volatilityMax - this.volatilityMin);
     
+    // Random direction with momentum
     let direction = Math.random() < 0.5 ? -1 : 1;
-    
     if (Math.random() < 0.7) {
       direction = this.lastDirection;
     }
-    
     this.lastDirection = direction;
     
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
+    // Price bounds
     const minPrice = this.initialPrice * 0.5;
     const maxPrice = this.initialPrice * 2.0;
     
@@ -249,6 +284,9 @@ class MultiTimeframeSimulator {
     return newPrice;
   }
 
+  /**
+   * Format datetime
+   */
   formatDateTime(date) {
     const pad = (n) => n.toString().padStart(2, '0');
     
@@ -258,22 +296,21 @@ class MultiTimeframeSimulator {
     };
   }
 
+  /**
+   * Save data to Firebase (FIXED VERSION)
+   */
   async saveToFirebase(timestamp, price) {
     try {
-      const volume = Math.floor(1000 + Math.random() * 49000);
-      
       // Update all timeframes
-      const closedBars = this.tfManager.updateOHLC(timestamp, price, volume);
+      const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, price);
       
-      // Prepare batch update
-      const updates = {};
       const date = new Date(timestamp * 1000);
       const { datetime, iso } = this.formatDateTime(date);
 
-      // Save closed bars (completed timeframes)
-      Object.entries(closedBars).forEach(([tf, bar]) => {
+      // ✅ STEP 1: Save all completed bars
+      for (const [tf, bar] of Object.entries(completedBars)) {
         const path = `${this.basePath}/ohlc_${tf}/${bar.timestamp}`;
-        updates[path] = {
+        const barData = {
           timestamp: bar.timestamp,
           datetime: this.formatDateTime(new Date(bar.timestamp * 1000)).datetime,
           datetime_iso: this.formatDateTime(new Date(bar.timestamp * 1000)).iso,
@@ -282,15 +319,18 @@ class MultiTimeframeSimulator {
           high: parseFloat(bar.high.toFixed(3)),
           low: parseFloat(bar.low.toFixed(3)),
           close: parseFloat(bar.close.toFixed(3)),
-          volume: bar.volume
+          volume: bar.volume,
+          isCompleted: true
         };
-      });
+        
+        await this.firebase.set(path, barData);
+        this.stats.totalWrites++;
+      }
 
-      // Always save current bars (including in-progress bars)
-      const currentBars = this.tfManager.getCurrentBars();
-      Object.entries(currentBars).forEach(([tf, bar]) => {
+      // ✅ STEP 2: Save all current bars (including in-progress)
+      for (const [tf, bar] of Object.entries(currentBars)) {
         const path = `${this.basePath}/ohlc_${tf}/${bar.timestamp}`;
-        updates[path] = {
+        const barData = {
           timestamp: bar.timestamp,
           datetime: this.formatDateTime(new Date(bar.timestamp * 1000)).datetime,
           datetime_iso: this.formatDateTime(new Date(bar.timestamp * 1000)).iso,
@@ -299,34 +339,41 @@ class MultiTimeframeSimulator {
           high: parseFloat(bar.high.toFixed(3)),
           low: parseFloat(bar.low.toFixed(3)),
           close: parseFloat(bar.close.toFixed(3)),
-          volume: bar.volume
+          volume: bar.volume,
+          isCompleted: bar.isCompleted || false
         };
-      });
+        
+        await this.firebase.set(path, barData);
+        this.stats.totalWrites++;
+      }
 
-      // Update current price
-      updates[this.currentPricePath] = {
+      // ✅ STEP 3: Update current price
+      const currentPriceData = {
         price: parseFloat(price.toFixed(3)),
         timestamp: timestamp,
         datetime: datetime,
         datetime_iso: iso,
         timezone: this.timezone,
-        change: parseFloat(((price - this.initialPrice) / this.initialPrice * 100).toFixed(2))
+        change: parseFloat(((price - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
+        change_24h: 0 // TODO: Calculate 24h change
       };
-
-      // Batch update to Firebase
-      await this.firebase.batchUpdate(updates);
       
-      // Log only on closed bars
-      if (Object.keys(closedBars).length > 0) {
-        const closedTfs = Object.keys(closedBars).join(', ');
-        logger.info(`[${datetime}] Closed bars: ${closedTfs} | Price: ${price.toFixed(3)}`);
+      await this.firebase.set(this.currentPricePath, currentPriceData);
+      this.stats.totalWrites++;
+      this.stats.lastWriteTime = Date.now();
+
+      // Log completed bars
+      if (Object.keys(completedBars).length > 0) {
+        const completedTfs = Object.keys(completedBars).join(', ');
+        logger.info(`[${datetime}] ✓ Completed: ${completedTfs} | Price: ${price.toFixed(3)}`);
       }
       
       this.consecutiveErrors = 0;
       
     } catch (error) {
       this.consecutiveErrors++;
-      logger.error(`Error saving to Firebase (${this.consecutiveErrors}/${this.maxConsecutiveErrors}): ${error.message}`);
+      this.stats.totalErrors++;
+      logger.error(`❌ Save error (${this.consecutiveErrors}/${this.maxConsecutiveErrors}): ${error.message}`);
       
       if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
         logger.error(`❌ Too many consecutive errors. Stopping...`);
@@ -337,6 +384,36 @@ class MultiTimeframeSimulator {
     }
   }
 
+  /**
+   * Save statistics
+   */
+  async saveStatistics() {
+    try {
+      const tfStats = this.tfManager.getStatistics();
+      const uptime = this.stats.startTime ? (Date.now() - this.stats.startTime) / 1000 : 0;
+      
+      const statsData = {
+        version: '2.0-fixed',
+        uptime_seconds: Math.floor(uptime),
+        total_iterations: this.stats.totalIterations,
+        total_writes: this.stats.totalWrites,
+        total_errors: this.stats.totalErrors,
+        current_price: this.currentPrice,
+        initial_price: this.initialPrice,
+        timeframes: tfStats.timeframes,
+        bars_created: tfStats.barsCreated,
+        last_update: new Date().toISOString()
+      };
+      
+      await this.firebase.set(this.statsPath, statsData);
+    } catch (error) {
+      logger.error(`Statistics update error: ${error.message}`);
+    }
+  }
+
+  /**
+   * Process single iteration
+   */
   async processIteration() {
     if (!this.isRunning) return;
     
@@ -348,9 +425,19 @@ class MultiTimeframeSimulator {
       
       this.currentPrice = newPrice;
       this.iteration++;
+      this.stats.totalIterations++;
+      
+      // Save statistics every 60 seconds
+      if (this.iteration % 60 === 0) {
+        await this.saveStatistics();
+        
+        // Log progress
+        const tfStats = this.tfManager.getStatistics();
+        logger.info(`📊 Progress: ${this.iteration} iterations | Bars created: ${JSON.stringify(tfStats.barsCreated)}`);
+      }
       
     } catch (error) {
-      logger.error(`Iteration error: ${error.message}`);
+      logger.error(`❌ Iteration error: ${error.message}`);
       
       if (this.consecutiveErrors < this.maxConsecutiveErrors) {
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -358,26 +445,39 @@ class MultiTimeframeSimulator {
     }
   }
 
+  /**
+   * Start simulator
+   */
   async run() {
-    logger.info(`🚀 Starting ${this.assetName} Multi-Timeframe Simulator...`);
-    logger.info(`📊 Generating: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
+    logger.info(`🚀 Starting ${this.assetName} Multi-Timeframe Simulator v2.0...`);
+    logger.info(`📊 Generating OHLC: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
     logger.info('⏱️  Running every second...');
+    logger.info('');
     
     this.isRunning = true;
+    this.stats.startTime = Date.now();
     
     const startTime = new Date();
     logger.info(`✅ Started at ${this.formatDateTime(startTime).datetime}`);
-    logger.info('Press Ctrl+C to stop\n');
+    logger.info('Press Ctrl+C to stop');
+    logger.info('');
+    
+    // Initial statistics save
+    await this.saveStatistics();
     
     this.intervalId = setInterval(() => {
       this.processIteration();
     }, 1000);
   }
 
+  /**
+   * Stop simulator
+   */
   async stop() {
     if (!this.isRunning) return;
     
-    logger.info('\n⏹️  Stopping simulator...');
+    logger.info('');
+    logger.info('⏹️  Stopping simulator...');
     this.isRunning = false;
     
     if (this.intervalId) {
@@ -385,7 +485,14 @@ class MultiTimeframeSimulator {
       this.intervalId = null;
     }
     
+    // Final statistics
+    await this.saveStatistics();
+    
+    const tfStats = this.tfManager.getStatistics();
     logger.info(`📊 Total iterations: ${this.iteration}`);
+    logger.info(`📊 Bars created: ${JSON.stringify(tfStats.barsCreated)}`);
+    logger.info(`📊 Total writes: ${this.stats.totalWrites}`);
+    logger.info(`📊 Total errors: ${this.stats.totalErrors}`);
     logger.info('✅ Simulator stopped gracefully');
     
     setTimeout(() => {
@@ -402,22 +509,27 @@ async function main() {
   console.log('🔧 System Configuration:');
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Platform: ${process.platform}`);
-  console.log(`   Mode: Multi-Timeframe REST API`);
+  console.log(`   Mode: Fixed Multi-Timeframe v2.0`);
   console.log('');
 
   const config = {
     initialPrice: process.env.INITIAL_PRICE || 40.022,
     assetName: process.env.ASSET_NAME || 'IDX_STC',
     timezone: process.env.TIMEZONE || 'Asia/Jakarta',
-    dailyVolatilityMin: process.env.DAILY_VOLATILITY_MIN || 0.001,
-    dailyVolatilityMax: process.env.DAILY_VOLATILITY_MAX || 0.005,
     secondVolatilityMin: process.env.SECOND_VOLATILITY_MIN || 0.00001,
     secondVolatilityMax: process.env.SECOND_VOLATILITY_MAX || 0.00008,
-    dataRetentionDays: process.env.DATA_RETENTION_DAYS || 7
   };
+
+  logger.info('Configuration loaded:');
+  logger.info(`  Asset: ${config.assetName}`);
+  logger.info(`  Initial Price: ${config.initialPrice}`);
+  logger.info(`  Timezone: ${config.timezone}`);
+  logger.info(`  Volatility: ${config.secondVolatilityMin} - ${config.secondVolatilityMax}`);
+  logger.info('');
 
   const simulator = new MultiTimeframeSimulator(config);
   
+  // Handle signals
   process.on('SIGINT', () => simulator.stop());
   process.on('SIGTERM', () => simulator.stop());
   process.on('SIGUSR2', () => simulator.stop());
@@ -443,4 +555,5 @@ async function main() {
   }
 }
 
+// Start simulator
 main();

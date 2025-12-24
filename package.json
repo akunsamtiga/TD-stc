@@ -1,7 +1,7 @@
 {
   "name": "idx-stc-trading-simulator",
-  "version": "2.1.0",
-  "description": "Optimized real-time trading price simulator with Firebase",
+  "version": "2.0.0",
+  "description": "Fixed Multi-Timeframe Trading Simulator with Complete OHLC Generation",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -11,20 +11,26 @@
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:stop": "pm2 stop idx-stc-simulator",
     "pm2:restart": "pm2 restart idx-stc-simulator",
+    "pm2:delete": "pm2 delete idx-stc-simulator",
     "pm2:logs": "pm2 logs idx-stc-simulator",
-    "pm2:monit": "pm2 monit"
+    "pm2:monit": "pm2 monit",
+    "clean": "rm -f simulator.log*"
   },
   "dependencies": {
-    "axios": "^1.13.2",
+    "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
   },
   "keywords": [
     "trading",
     "simulator",
     "firebase",
     "ohlc",
-    "optimized"
+    "realtime",
+    "multi-timeframe"
   ],
   "author": "",
   "license": "MIT",
