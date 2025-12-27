@@ -8,6 +8,8 @@ import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import jwt from 'jsonwebtoken';
+
 
 dotenv.config();
 
@@ -123,58 +125,57 @@ class SecureFirebaseRestClient {
   /**
    * ✅ Get OAuth2 Access Token using Service Account
    */
-  async getAccessToken() {
-    // Check if token is still valid
-    const now = Date.now();
-    if (this.accessToken && this.tokenExpiry > now + 60000) {
-      return this.accessToken;
-    }
-
-    try {
-      logger.debug('🔐 Getting new access token...');
-
-      // Create JWT for Google OAuth2
-      const jwt = require('jsonwebtoken');
-      const now = Math.floor(Date.now() / 1000);
-      
-      const payload = {
-        iss: this.credentials.client_email,
-        sub: this.credentials.client_email,
-        aud: 'https://oauth2.googleapis.com/token',
-        iat: now,
-        exp: now + 3600,
-        scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email'
-      };
-
-      const token = jwt.sign(payload, this.credentials.private_key, { 
-        algorithm: 'RS256' 
-      });
-
-      // Exchange JWT for access token
-      const response = await axios.post(
-        'https://oauth2.googleapis.com/token',
-        {
-          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-          assertion: token
-        },
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-          }
-        }
-      );
-
-      this.accessToken = response.data.access_token;
-      this.tokenExpiry = now + (response.data.expires_in * 1000);
-      
-      logger.info('✅ Access token obtained successfully');
-      return this.accessToken;
-
-    } catch (error) {
-      logger.error(`❌ Failed to get access token: ${error.message}`);
-      throw error;
-    }
+async getAccessToken() {
+  // Check if token is still valid
+  const now = Date.now();
+  if (this.accessToken && this.tokenExpiry > now + 60000) {
+    return this.accessToken;
   }
+
+  try {
+    logger.debug('🔑 Getting new access token...');
+
+    // ✅ FIXED: jwt is now imported at the top
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    
+    const payload = {
+      iss: this.credentials.client_email,
+      sub: this.credentials.client_email,
+      aud: 'https://oauth2.googleapis.com/token',
+      iat: nowSeconds,
+      exp: nowSeconds + 3600,
+      scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email'
+    };
+
+    const token = jwt.sign(payload, this.credentials.private_key, { 
+      algorithm: 'RS256' 
+    });
+
+    // Exchange JWT for access token
+    const response = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      {
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: token
+      },
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+
+    this.accessToken = response.data.access_token;
+    this.tokenExpiry = now + (response.data.expires_in * 1000);
+    
+    logger.info('✅ Access token obtained successfully');
+    return this.accessToken;
+
+  } catch (error) {
+    logger.error(`❌ Failed to get access token: ${error.message}`);
+    throw error;
+  }
+}
 
   async set(path, data) {
     try {
