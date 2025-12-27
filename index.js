@@ -161,12 +161,13 @@ class SecureFirebaseRestClient {
         });
         logger.debug('✅ JWT signed successfully');
       } catch (jwtError) {
-        logger.error(`❌ JWT signing failed: ${jwtError.message}`);
-        throw new Error(`JWT signing failed: ${jwtError.message}`);
+        logger.error(`❌ JWT signing failed: ${jwtError.message || jwtError}`);
+        throw new Error(`JWT signing failed: ${jwtError.message || jwtError}`);
       }
 
       // Exchange JWT for access token
       logger.debug('🔄 Exchanging JWT for access token...');
+      logger.debug('🌐 Connecting to: https://oauth2.googleapis.com/token');
       
       const response = await axios.post(
         'https://oauth2.googleapis.com/token',
@@ -177,7 +178,9 @@ class SecureFirebaseRestClient {
         {
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded'
-          }
+          },
+          timeout: 10000,
+          family: 4 // Force IPv4
         }
       );
 
@@ -190,17 +193,33 @@ class SecureFirebaseRestClient {
       return this.accessToken;
 
     } catch (error) {
+      // Detailed error logging
+      logger.error('❌ OAuth2 Token Exchange Failed');
+      logger.error(`   Error Type: ${error.constructor.name}`);
+      logger.error(`   Error Code: ${error.code || 'N/A'}`);
+      logger.error(`   Error Message: ${error.message || 'Unknown'}`);
+      
       if (error.response) {
         // Server responded with error
-        logger.error(`❌ OAuth2 error (${error.response.status}): ${JSON.stringify(error.response.data)}`);
+        logger.error(`   HTTP Status: ${error.response.status}`);
+        logger.error(`   Response Data: ${JSON.stringify(error.response.data)}`);
+        logger.error(`   Response Headers: ${JSON.stringify(error.response.headers)}`);
       } else if (error.request) {
         // Request made but no response
-        logger.error(`❌ No response from OAuth2 server: ${error.message}`);
+        logger.error(`   No response received from server`);
+        logger.error(`   Request details: ${JSON.stringify({
+          method: error.request.method,
+          path: error.request.path,
+          host: error.request.host
+        })}`);
       } else {
         // Error setting up request
-        logger.error(`❌ Request setup error: ${error.message}`);
+        logger.error(`   Request setup failed`);
       }
-      throw new Error(`Failed to get access token: ${error.message}`);
+      
+      logger.error(`   Full Error: ${JSON.stringify(error, null, 2)}`);
+      
+      throw new Error(`Failed to get access token: ${error.message || error.code || 'Unknown error'}`);
     }
   }
 
@@ -641,6 +660,47 @@ class SecureMultiTimeframeSimulator {
 }
 
 // ============================================
+// NETWORK DIAGNOSTICS
+// ============================================
+async function testNetworkConnectivity() {
+  logger.info('🌐 Testing network connectivity...');
+  
+  const tests = [
+    { name: 'Google DNS', url: 'https://dns.google', timeout: 5000 },
+    { name: 'Google OAuth2', url: 'https://oauth2.googleapis.com', timeout: 5000 },
+    { name: 'Firebase', url: 'https://firebase.google.com', timeout: 5000 }
+  ];
+  
+  let passed = 0;
+  
+  for (const test of tests) {
+    try {
+      const response = await axios.get(test.url, { 
+        timeout: test.timeout,
+        family: 4 // Force IPv4
+      });
+      logger.info(`✅ ${test.name}: OK (${response.status})`);
+      passed++;
+    } catch (error) {
+      logger.warn(`⚠️  ${test.name}: FAILED`);
+      logger.warn(`   Error: ${error.code || error.message}`);
+    }
+  }
+  
+  if (passed === 0) {
+    logger.error('❌ No network connectivity detected!');
+    logger.error('   Please check:');
+    logger.error('   1. Internet connection');
+    logger.error('   2. DNS settings');
+    logger.error('   3. Firewall rules');
+    throw new Error('No network connectivity');
+  }
+  
+  logger.info(`🌐 Network test: ${passed}/${tests.length} passed`);
+  logger.info('');
+}
+
+// ============================================
 // MAIN EXECUTION
 // ============================================
 async function main() {
@@ -698,6 +758,9 @@ async function main() {
   });
   
   try {
+    // Test network first
+    await testNetworkConnectivity();
+    
     const credentialsPath = process.env.FIREBASE_SERVICE_ACCOUNT || 
                            join(process.cwd(), 'firebase_credentials.json');
     
