@@ -1,6 +1,6 @@
 // ============================================
 // FIXED IDX_STC MULTI-TIMEFRAME SIMULATOR
-// Version: 2.0 - Complete OHLC Generation
+// Version: 2.1 - TIMEZONE SYNCHRONIZED
 // ============================================
 
 import axios from 'axios';
@@ -8,6 +8,9 @@ import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
 
 dotenv.config();
+
+// ✅ CRITICAL: Set timezone BEFORE anything else
+process.env.TZ = 'Asia/Jakarta';
 
 // ============================================
 // LOGGER CONFIGURATION
@@ -37,6 +40,57 @@ const logger = createLogger({
     })
   ]
 });
+
+// ============================================
+// TIMEZONE UTILITY (Same as Backend)
+// ============================================
+class TimezoneUtil {
+  /**
+   * Get current timestamp in seconds
+   */
+  static getCurrentTimestamp() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * Format date to Asia/Jakarta timezone
+   * Format: YYYY-MM-DD HH:mm:ss
+   */
+  static formatDateTime(date = new Date()) {
+    // ✅ Convert to Indonesia timezone (WIB = UTC+7)
+    const jakartaDate = new Date(date.toLocaleString('en-US', { 
+      timeZone: 'Asia/Jakarta' 
+    }));
+    
+    const year = jakartaDate.getFullYear();
+    const month = String(jakartaDate.getMonth() + 1).padStart(2, '0');
+    const day = String(jakartaDate.getDate()).padStart(2, '0');
+    const hours = String(jakartaDate.getHours()).padStart(2, '0');
+    const minutes = String(jakartaDate.getMinutes()).padStart(2, '0');
+    const seconds = String(jakartaDate.getSeconds()).padStart(2, '0');
+    
+    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+  }
+
+  /**
+   * Get ISO string
+   */
+  static toISOString(date = new Date()) {
+    return date.toISOString();
+  }
+
+  /**
+   * Get complete datetime info
+   */
+  static getDateTimeInfo(date = new Date()) {
+    return {
+      datetime: this.formatDateTime(date),
+      datetime_iso: this.toISOString(date),
+      timestamp: Math.floor(date.getTime() / 1000),
+      timezone: 'Asia/Jakarta'
+    };
+  }
+}
 
 // ============================================
 // FIREBASE REST API CLIENT
@@ -95,11 +149,10 @@ class FirebaseRestClient {
 }
 
 // ============================================
-// TIMEFRAME MANAGER (FIXED VERSION)
+// TIMEFRAME MANAGER
 // ============================================
 class TimeframeManager {
   constructor() {
-    // Timeframe definitions in seconds
     this.timeframes = {
       '1s': 1,
       '1m': 60,
@@ -110,32 +163,22 @@ class TimeframeManager {
       '1d': 86400
     };
 
-    // Current OHLC bars for each timeframe
     this.bars = {};
     
-    // Initialize bars
     Object.keys(this.timeframes).forEach(tf => {
       this.bars[tf] = null;
     });
 
-    // Statistics
     this.barsCreated = {};
     Object.keys(this.timeframes).forEach(tf => {
       this.barsCreated[tf] = 0;
     });
   }
 
-  /**
-   * Get the bar timestamp (floor to boundary)
-   */
   getBarTimestamp(timestamp, timeframeSeconds) {
     return Math.floor(timestamp / timeframeSeconds) * timeframeSeconds;
   }
 
-  /**
-   * Update OHLC for a price tick
-   * Returns: { completed: [...], current: [...] }
-   */
   updateOHLC(timestamp, price) {
     const completedBars = {};
     const currentBars = {};
@@ -143,9 +186,7 @@ class TimeframeManager {
     Object.entries(this.timeframes).forEach(([tf, seconds]) => {
       const barTimestamp = this.getBarTimestamp(timestamp, seconds);
 
-      // Check if we need a new bar
       if (!this.bars[tf] || this.bars[tf].timestamp !== barTimestamp) {
-        // Save completed bar
         if (this.bars[tf]) {
           completedBars[tf] = {
             ...this.bars[tf],
@@ -154,7 +195,6 @@ class TimeframeManager {
           this.barsCreated[tf]++;
         }
 
-        // Start new bar
         this.bars[tf] = {
           timestamp: barTimestamp,
           open: price,
@@ -165,25 +205,18 @@ class TimeframeManager {
           isCompleted: false
         };
       } else {
-        // Update existing bar
         this.bars[tf].high = Math.max(this.bars[tf].high, price);
         this.bars[tf].low = Math.min(this.bars[tf].low, price);
         this.bars[tf].close = price;
       }
       
-      // Add volume
       this.bars[tf].volume += Math.floor(1000 + Math.random() * 49000);
-
-      // Always include current bar
       currentBars[tf] = { ...this.bars[tf] };
     });
 
     return { completedBars, currentBars };
   }
 
-  /**
-   * Get statistics
-   */
   getStatistics() {
     return {
       timeframes: Object.keys(this.timeframes),
@@ -194,7 +227,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// MULTI-TIMEFRAME SIMULATOR (FIXED VERSION)
+// MULTI-TIMEFRAME SIMULATOR
 // ============================================
 class MultiTimeframeSimulator {
   constructor(config) {
@@ -214,10 +247,8 @@ class MultiTimeframeSimulator {
     this.isRunning = false;
     this.intervalId = null;
     
-    // Initialize timeframe manager
     this.tfManager = new TimeframeManager();
     
-    // Statistics
     this.stats = {
       totalIterations: 0,
       totalWrites: 0,
@@ -226,7 +257,7 @@ class MultiTimeframeSimulator {
       lastWriteTime: null
     };
     
-    logger.info(`${this.assetName} Multi-Timeframe Simulator v2.0 initialized`);
+    logger.info(`${this.assetName} Multi-Timeframe Simulator v2.1 initialized`);
     logger.info(`Timeframes: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
   }
 
@@ -240,15 +271,16 @@ class MultiTimeframeSimulator {
       this.currentPricePath = `${assetPath}/current_price`;
       this.statsPath = `${assetPath}/stats`;
       
-      // Test connection
       await this.firebase.set('/test_connection', { 
-        test: 'simulator_v2',
+        test: 'simulator_v2.1',
         timestamp: Date.now(),
-        version: '2.0-fixed'
+        version: '2.1-timezone-sync',
+        timezone: this.timezone
       });
       
       logger.info('✅ Firebase connection successful!');
       logger.info('✅ Multi-timeframe OHLC generation enabled');
+      logger.info(`✅ Timezone: ${this.timezone} (WIB = UTC+7)`);
       return true;
       
     } catch (error) {
@@ -257,14 +289,10 @@ class MultiTimeframeSimulator {
     }
   }
 
-  /**
-   * Generate next price with random walk
-   */
   generatePriceMovement() {
     const volatility = this.volatilityMin + 
       Math.random() * (this.volatilityMax - this.volatilityMin);
     
-    // Random direction with momentum
     let direction = Math.random() < 0.5 ? -1 : 1;
     if (Math.random() < 0.7) {
       direction = this.lastDirection;
@@ -274,7 +302,6 @@ class MultiTimeframeSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // Price bounds
     const minPrice = this.initialPrice * 0.5;
     const maxPrice = this.initialPrice * 2.0;
     
@@ -285,35 +312,26 @@ class MultiTimeframeSimulator {
   }
 
   /**
-   * Format datetime
-   */
-  formatDateTime(date) {
-    const pad = (n) => n.toString().padStart(2, '0');
-    
-    return {
-      datetime: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`,
-      iso: date.toISOString()
-    };
-  }
-
-  /**
-   * Save data to Firebase (FIXED VERSION)
+   * ✅ UPDATED: Save to Firebase with proper timezone
    */
   async saveToFirebase(timestamp, price) {
     try {
-      // Update all timeframes
       const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, price);
       
+      // ✅ Use TimezoneUtil for consistent formatting
       const date = new Date(timestamp * 1000);
-      const { datetime, iso } = this.formatDateTime(date);
+      const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ STEP 1: Save all completed bars
+      // Save completed bars
       for (const [tf, bar] of Object.entries(completedBars)) {
         const path = `${this.basePath}/ohlc_${tf}/${bar.timestamp}`;
+        const barDate = new Date(bar.timestamp * 1000);
+        const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
+        
         const barData = {
           timestamp: bar.timestamp,
-          datetime: this.formatDateTime(new Date(bar.timestamp * 1000)).datetime,
-          datetime_iso: this.formatDateTime(new Date(bar.timestamp * 1000)).iso,
+          datetime: barDateTime.datetime,
+          datetime_iso: barDateTime.datetime_iso,
           timezone: this.timezone,
           open: parseFloat(bar.open.toFixed(3)),
           high: parseFloat(bar.high.toFixed(3)),
@@ -327,13 +345,16 @@ class MultiTimeframeSimulator {
         this.stats.totalWrites++;
       }
 
-      // ✅ STEP 2: Save all current bars (including in-progress)
+      // Save current bars
       for (const [tf, bar] of Object.entries(currentBars)) {
         const path = `${this.basePath}/ohlc_${tf}/${bar.timestamp}`;
+        const barDate = new Date(bar.timestamp * 1000);
+        const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
+        
         const barData = {
           timestamp: bar.timestamp,
-          datetime: this.formatDateTime(new Date(bar.timestamp * 1000)).datetime,
-          datetime_iso: this.formatDateTime(new Date(bar.timestamp * 1000)).iso,
+          datetime: barDateTime.datetime,
+          datetime_iso: barDateTime.datetime_iso,
           timezone: this.timezone,
           open: parseFloat(bar.open.toFixed(3)),
           high: parseFloat(bar.high.toFixed(3)),
@@ -347,15 +368,15 @@ class MultiTimeframeSimulator {
         this.stats.totalWrites++;
       }
 
-      // ✅ STEP 3: Update current price
+      // Update current price
       const currentPriceData = {
         price: parseFloat(price.toFixed(3)),
         timestamp: timestamp,
-        datetime: datetime,
-        datetime_iso: iso,
+        datetime: dateTimeInfo.datetime,
+        datetime_iso: dateTimeInfo.datetime_iso,
         timezone: this.timezone,
         change: parseFloat(((price - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
-        change_24h: 0 // TODO: Calculate 24h change
+        change_24h: 0
       };
       
       await this.firebase.set(this.currentPricePath, currentPriceData);
@@ -365,7 +386,7 @@ class MultiTimeframeSimulator {
       // Log completed bars
       if (Object.keys(completedBars).length > 0) {
         const completedTfs = Object.keys(completedBars).join(', ');
-        logger.info(`[${datetime}] ✓ Completed: ${completedTfs} | Price: ${price.toFixed(3)}`);
+        logger.info(`[${dateTimeInfo.datetime} WIB] ✓ Completed: ${completedTfs} | Price: ${price.toFixed(3)}`);
       }
       
       this.consecutiveErrors = 0;
@@ -384,16 +405,14 @@ class MultiTimeframeSimulator {
     }
   }
 
-  /**
-   * Save statistics
-   */
   async saveStatistics() {
     try {
       const tfStats = this.tfManager.getStatistics();
       const uptime = this.stats.startTime ? (Date.now() - this.stats.startTime) / 1000 : 0;
       
       const statsData = {
-        version: '2.0-fixed',
+        version: '2.1-timezone-sync',
+        timezone: this.timezone,
         uptime_seconds: Math.floor(uptime),
         total_iterations: this.stats.totalIterations,
         total_writes: this.stats.totalWrites,
@@ -402,7 +421,8 @@ class MultiTimeframeSimulator {
         initial_price: this.initialPrice,
         timeframes: tfStats.timeframes,
         bars_created: tfStats.barsCreated,
-        last_update: new Date().toISOString()
+        last_update: TimezoneUtil.toISOString(),
+        last_update_wib: TimezoneUtil.formatDateTime()
       };
       
       await this.firebase.set(this.statsPath, statsData);
@@ -411,14 +431,11 @@ class MultiTimeframeSimulator {
     }
   }
 
-  /**
-   * Process single iteration
-   */
   async processIteration() {
     if (!this.isRunning) return;
     
     try {
-      const timestamp = Math.floor(Date.now() / 1000);
+      const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
       
       await this.saveToFirebase(timestamp, newPrice);
@@ -427,11 +444,9 @@ class MultiTimeframeSimulator {
       this.iteration++;
       this.stats.totalIterations++;
       
-      // Save statistics every 60 seconds
       if (this.iteration % 60 === 0) {
         await this.saveStatistics();
         
-        // Log progress
         const tfStats = this.tfManager.getStatistics();
         logger.info(`📊 Progress: ${this.iteration} iterations | Bars created: ${JSON.stringify(tfStats.barsCreated)}`);
       }
@@ -445,11 +460,12 @@ class MultiTimeframeSimulator {
     }
   }
 
-  /**
-   * Start simulator
-   */
   async run() {
-    logger.info(`🚀 Starting ${this.assetName} Multi-Timeframe Simulator v2.0...`);
+    const currentTime = TimezoneUtil.formatDateTime();
+    
+    logger.info(`🚀 Starting ${this.assetName} Multi-Timeframe Simulator v2.1...`);
+    logger.info(`🌍 Timezone: ${this.timezone} (WIB = UTC+7)`);
+    logger.info(`⏰ Current Time: ${currentTime}`);
     logger.info(`📊 Generating OHLC: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
     logger.info('⏱️  Running every second...');
     logger.info('');
@@ -457,12 +473,10 @@ class MultiTimeframeSimulator {
     this.isRunning = true;
     this.stats.startTime = Date.now();
     
-    const startTime = new Date();
-    logger.info(`✅ Started at ${this.formatDateTime(startTime).datetime}`);
+    logger.info(`✅ Started at ${currentTime} WIB`);
     logger.info('Press Ctrl+C to stop');
     logger.info('');
     
-    // Initial statistics save
     await this.saveStatistics();
     
     this.intervalId = setInterval(() => {
@@ -470,9 +484,6 @@ class MultiTimeframeSimulator {
     }, 1000);
   }
 
-  /**
-   * Stop simulator
-   */
   async stop() {
     if (!this.isRunning) return;
     
@@ -485,7 +496,6 @@ class MultiTimeframeSimulator {
       this.intervalId = null;
     }
     
-    // Final statistics
     await this.saveStatistics();
     
     const tfStats = this.tfManager.getStatistics();
@@ -506,10 +516,19 @@ class MultiTimeframeSimulator {
 // ============================================
 async function main() {
   console.log('');
+  console.log('🌍 ================================================');
+  console.log('🌍 TIMEZONE CONFIGURATION');
+  console.log('🌍 ================================================');
+  console.log(`🌍 Process TZ: ${process.env.TZ}`);
+  console.log(`🌍 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
+  console.log(`🌍 Current Time (ISO): ${TimezoneUtil.toISOString()}`);
+  console.log(`🌍 Unix Timestamp: ${TimezoneUtil.getCurrentTimestamp()}`);
+  console.log('🌍 ================================================');
+  console.log('');
   console.log('🔧 System Configuration:');
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Platform: ${process.platform}`);
-  console.log(`   Mode: Fixed Multi-Timeframe v2.0`);
+  console.log(`   Mode: Fixed Multi-Timeframe v2.1 (Timezone Sync)`);
   console.log('');
 
   const config = {
@@ -529,7 +548,6 @@ async function main() {
 
   const simulator = new MultiTimeframeSimulator(config);
   
-  // Handle signals
   process.on('SIGINT', () => simulator.stop());
   process.on('SIGTERM', () => simulator.stop());
   process.on('SIGUSR2', () => simulator.stop());
@@ -555,5 +573,4 @@ async function main() {
   }
 }
 
-// Start simulator
 main();

@@ -16,12 +16,14 @@ module.exports = {
     env_production: {
       NODE_ENV: 'production',
       NODE_OPTIONS: '--dns-result-order=ipv4first',
-      LOG_LEVEL: 'info'
+      LOG_LEVEL: 'info',
+      TZ: 'Asia/Jakarta',
     },
     env_development: {
       NODE_ENV: 'development',
       NODE_OPTIONS: '--dns-result-order=ipv4first',
-      LOG_LEVEL: 'debug'
+      LOG_LEVEL: 'debug',
+      TZ: 'Asia/Jakarta',
     },
     
     // Restart configuration
