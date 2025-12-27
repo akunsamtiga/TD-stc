@@ -1,6 +1,6 @@
 // ============================================
 // SECURE IDX_STC MULTI-TIMEFRAME SIMULATOR
-// Version: 2.2 - AUTHENTICATED & SECURE
+// Version: 2.3 - FIXED AUTHENTICATION
 // ============================================
 
 import axios from 'axios';
@@ -9,7 +9,6 @@ import { createLogger, format, transports } from 'winston';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import jwt from 'jsonwebtoken';
-
 
 dotenv.config();
 
@@ -116,66 +115,94 @@ class SecureFirebaseRestClient {
 
     // ✅ Add interceptor to inject authentication token
     this.client.interceptors.request.use(async (config) => {
-      const token = await this.getAccessToken();
-      config.headers['Authorization'] = `Bearer ${token}`;
-      return config;
+      try {
+        const token = await this.getAccessToken();
+        config.headers['Authorization'] = `Bearer ${token}`;
+        return config;
+      } catch (error) {
+        logger.error(`❌ Interceptor error: ${error.message}`);
+        throw error;
+      }
     });
   }
 
   /**
    * ✅ Get OAuth2 Access Token using Service Account
    */
-async getAccessToken() {
-  // Check if token is still valid
-  const now = Date.now();
-  if (this.accessToken && this.tokenExpiry > now + 60000) {
-    return this.accessToken;
-  }
+  async getAccessToken() {
+    // Check if token is still valid
+    const now = Date.now();
+    if (this.accessToken && this.tokenExpiry > now + 60000) {
+      return this.accessToken;
+    }
 
-  try {
-    logger.debug('🔑 Getting new access token...');
+    try {
+      logger.debug('🔑 Getting new access token...');
 
-    // ✅ FIXED: jwt is now imported at the top
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    
-    const payload = {
-      iss: this.credentials.client_email,
-      sub: this.credentials.client_email,
-      aud: 'https://oauth2.googleapis.com/token',
-      iat: nowSeconds,
-      exp: nowSeconds + 3600,
-      scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email'
-    };
+      // Create JWT for Google OAuth2
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      
+      const payload = {
+        iss: this.credentials.client_email,
+        sub: this.credentials.client_email,
+        aud: 'https://oauth2.googleapis.com/token',
+        iat: nowSeconds,
+        exp: nowSeconds + 3600,
+        scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email'
+      };
 
-    const token = jwt.sign(payload, this.credentials.private_key, { 
-      algorithm: 'RS256' 
-    });
+      logger.debug(`🔑 JWT Payload: ${JSON.stringify(payload)}`);
 
-    // Exchange JWT for access token
-    const response = await axios.post(
-      'https://oauth2.googleapis.com/token',
-      {
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        assertion: token
-      },
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
+      // Sign JWT
+      let token;
+      try {
+        token = jwt.sign(payload, this.credentials.private_key, { 
+          algorithm: 'RS256' 
+        });
+        logger.debug('✅ JWT signed successfully');
+      } catch (jwtError) {
+        logger.error(`❌ JWT signing failed: ${jwtError.message}`);
+        throw new Error(`JWT signing failed: ${jwtError.message}`);
       }
-    );
 
-    this.accessToken = response.data.access_token;
-    this.tokenExpiry = now + (response.data.expires_in * 1000);
-    
-    logger.info('✅ Access token obtained successfully');
-    return this.accessToken;
+      // Exchange JWT for access token
+      logger.debug('🔄 Exchanging JWT for access token...');
+      
+      const response = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: token
+        }).toString(),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
 
-  } catch (error) {
-    logger.error(`❌ Failed to get access token: ${error.message}`);
-    throw error;
+      this.accessToken = response.data.access_token;
+      this.tokenExpiry = now + (response.data.expires_in * 1000);
+      
+      logger.info('✅ Access token obtained successfully');
+      logger.debug(`🔑 Token expires in: ${response.data.expires_in} seconds`);
+      
+      return this.accessToken;
+
+    } catch (error) {
+      if (error.response) {
+        // Server responded with error
+        logger.error(`❌ OAuth2 error (${error.response.status}): ${JSON.stringify(error.response.data)}`);
+      } else if (error.request) {
+        // Request made but no response
+        logger.error(`❌ No response from OAuth2 server: ${error.message}`);
+      } else {
+        // Error setting up request
+        logger.error(`❌ Request setup error: ${error.message}`);
+      }
+      throw new Error(`Failed to get access token: ${error.message}`);
+    }
   }
-}
 
   async set(path, data) {
     try {
@@ -187,6 +214,14 @@ async getAccessToken() {
         this.accessToken = null;
         return await this.set(path, data);
       }
+      
+      // Better error logging
+      if (error.response) {
+        logger.error(`❌ Firebase set error (${error.response.status}): ${JSON.stringify(error.response.data)}`);
+      } else {
+        logger.error(`❌ Firebase set error: ${error.message}`);
+      }
+      
       throw new Error(`Firebase set error: ${error.message}`);
     }
   }
@@ -235,7 +270,7 @@ async getAccessToken() {
 }
 
 // ============================================
-// TIMEFRAME MANAGER (Same as before)
+// TIMEFRAME MANAGER
 // ============================================
 class TimeframeManager {
   constructor() {
@@ -343,7 +378,7 @@ class SecureMultiTimeframeSimulator {
       lastWriteTime: null
     };
     
-    logger.info(`${this.assetName} SECURE Multi-Timeframe Simulator v2.2 initialized`);
+    logger.info(`${this.assetName} SECURE Multi-Timeframe Simulator v2.3 initialized`);
     logger.info(`🔐 Authentication: Service Account`);
     logger.info(`📊 Timeframes: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
   }
@@ -361,10 +396,11 @@ class SecureMultiTimeframeSimulator {
       this.statsPath = `${assetPath}/stats`;
       
       // Test connection with authentication
+      logger.info('🧪 Testing Firebase connection...');
       await this.firebase.set('/test_connection', { 
-        test: 'secure_simulator_v2.2',
+        test: 'secure_simulator_v2.3',
         timestamp: Date.now(),
-        version: '2.2-secure-authenticated',
+        version: '2.3-secure-authenticated',
         timezone: this.timezone,
         authenticated: true
       });
@@ -377,6 +413,9 @@ class SecureMultiTimeframeSimulator {
       
     } catch (error) {
       logger.error(`❌ Firebase initialization error: ${error.message}`);
+      if (error.stack) {
+        logger.error(`Stack trace: ${error.stack}`);
+      }
       throw error;
     }
   }
@@ -499,7 +538,7 @@ class SecureMultiTimeframeSimulator {
       const uptime = this.stats.startTime ? (Date.now() - this.stats.startTime) / 1000 : 0;
       
       const statsData = {
-        version: '2.2-secure-authenticated',
+        version: '2.3-secure-authenticated',
         timezone: this.timezone,
         uptime_seconds: Math.floor(uptime),
         total_iterations: this.stats.totalIterations,
@@ -552,7 +591,7 @@ class SecureMultiTimeframeSimulator {
   async run() {
     const currentTime = TimezoneUtil.formatDateTime();
     
-    logger.info(`🚀 Starting SECURE ${this.assetName} Multi-Timeframe Simulator v2.2...`);
+    logger.info(`🚀 Starting SECURE ${this.assetName} Multi-Timeframe Simulator v2.3...`);
     logger.info(`🔐 Authentication: Enabled (Service Account)`);
     logger.info(`🌍 Timezone: ${this.timezone} (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${currentTime}`);
@@ -622,7 +661,7 @@ async function main() {
   console.log('🔧 System Configuration:');
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Platform: ${process.platform}`);
-  console.log(`   Mode: Secure Multi-Timeframe v2.2 (Authenticated)`);
+  console.log(`   Mode: Secure Multi-Timeframe v2.3 (Authenticated)`);
   console.log('');
 
   const config = {
