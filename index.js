@@ -1,11 +1,13 @@
 // ============================================
-// FIXED IDX_STC MULTI-TIMEFRAME SIMULATOR
-// Version: 2.1 - TIMEZONE SYNCHRONIZED
+// SECURE IDX_STC MULTI-TIMEFRAME SIMULATOR
+// Version: 2.2 - AUTHENTICATED & SECURE
 // ============================================
 
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 dotenv.config();
 
@@ -42,22 +44,14 @@ const logger = createLogger({
 });
 
 // ============================================
-// TIMEZONE UTILITY (Same as Backend)
+// TIMEZONE UTILITY
 // ============================================
 class TimezoneUtil {
-  /**
-   * Get current timestamp in seconds
-   */
   static getCurrentTimestamp() {
     return Math.floor(Date.now() / 1000);
   }
 
-  /**
-   * Format date to Asia/Jakarta timezone
-   * Format: YYYY-MM-DD HH:mm:ss
-   */
   static formatDateTime(date = new Date()) {
-    // ✅ Convert to Indonesia timezone (WIB = UTC+7)
     const jakartaDate = new Date(date.toLocaleString('en-US', { 
       timeZone: 'Asia/Jakarta' 
     }));
@@ -72,16 +66,10 @@ class TimezoneUtil {
     return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
   }
 
-  /**
-   * Get ISO string
-   */
   static toISOString(date = new Date()) {
     return date.toISOString();
   }
 
-  /**
-   * Get complete datetime info
-   */
   static getDateTimeInfo(date = new Date()) {
     return {
       datetime: this.formatDateTime(date),
@@ -93,22 +81,99 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE REST API CLIENT
+// ✅ SECURE FIREBASE REST API CLIENT
+// With OAuth2 Authentication
 // ============================================
-class FirebaseRestClient {
-  constructor(databaseURL) {
+class SecureFirebaseRestClient {
+  constructor(databaseURL, credentialsPath) {
     this.databaseURL = databaseURL.replace(/\/$/, '');
+    this.credentialsPath = credentialsPath;
+    this.accessToken = null;
+    this.tokenExpiry = 0;
+    
+    // Load service account credentials
+    try {
+      const credentialsData = readFileSync(this.credentialsPath, 'utf8');
+      this.credentials = JSON.parse(credentialsData);
+      logger.info('✅ Service account credentials loaded');
+    } catch (error) {
+      logger.error(`❌ Failed to load credentials: ${error.message}`);
+      throw error;
+    }
     
     this.client = axios.create({
       baseURL: this.databaseURL,
       timeout: 15000,
-      family: 4, // Force IPv4
+      family: 4,
       headers: {
         'Content-Type': 'application/json'
       },
       validateStatus: (status) => status >= 200 && status < 300,
       maxRedirects: 5,
     });
+
+    // ✅ Add interceptor to inject authentication token
+    this.client.interceptors.request.use(async (config) => {
+      const token = await this.getAccessToken();
+      config.headers['Authorization'] = `Bearer ${token}`;
+      return config;
+    });
+  }
+
+  /**
+   * ✅ Get OAuth2 Access Token using Service Account
+   */
+  async getAccessToken() {
+    // Check if token is still valid
+    const now = Date.now();
+    if (this.accessToken && this.tokenExpiry > now + 60000) {
+      return this.accessToken;
+    }
+
+    try {
+      logger.debug('🔐 Getting new access token...');
+
+      // Create JWT for Google OAuth2
+      const jwt = require('jsonwebtoken');
+      const now = Math.floor(Date.now() / 1000);
+      
+      const payload = {
+        iss: this.credentials.client_email,
+        sub: this.credentials.client_email,
+        aud: 'https://oauth2.googleapis.com/token',
+        iat: now,
+        exp: now + 3600,
+        scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email'
+      };
+
+      const token = jwt.sign(payload, this.credentials.private_key, { 
+        algorithm: 'RS256' 
+      });
+
+      // Exchange JWT for access token
+      const response = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        {
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: token
+        },
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+
+      this.accessToken = response.data.access_token;
+      this.tokenExpiry = now + (response.data.expires_in * 1000);
+      
+      logger.info('✅ Access token obtained successfully');
+      return this.accessToken;
+
+    } catch (error) {
+      logger.error(`❌ Failed to get access token: ${error.message}`);
+      throw error;
+    }
   }
 
   async set(path, data) {
@@ -116,6 +181,11 @@ class FirebaseRestClient {
       const response = await this.client.put(`${path}.json`, data);
       return response.data;
     } catch (error) {
+      if (error.response?.status === 401) {
+        logger.warn('⚠️ Token expired, refreshing...');
+        this.accessToken = null;
+        return await this.set(path, data);
+      }
       throw new Error(`Firebase set error: ${error.message}`);
     }
   }
@@ -125,6 +195,11 @@ class FirebaseRestClient {
       const response = await this.client.patch(`${path}.json`, data);
       return response.data;
     } catch (error) {
+      if (error.response?.status === 401) {
+        logger.warn('⚠️ Token expired, refreshing...');
+        this.accessToken = null;
+        return await this.update(path, data);
+      }
       throw new Error(`Firebase update error: ${error.message}`);
     }
   }
@@ -134,6 +209,11 @@ class FirebaseRestClient {
       const response = await this.client.get(`${path}.json`);
       return response.data;
     } catch (error) {
+      if (error.response?.status === 401) {
+        logger.warn('⚠️ Token expired, refreshing...');
+        this.accessToken = null;
+        return await this.get(path);
+      }
       throw new Error(`Firebase get error: ${error.message}`);
     }
   }
@@ -143,13 +223,18 @@ class FirebaseRestClient {
       const response = await this.client.delete(`${path}.json`);
       return response.data;
     } catch (error) {
+      if (error.response?.status === 401) {
+        logger.warn('⚠️ Token expired, refreshing...');
+        this.accessToken = null;
+        return await this.delete(path);
+      }
       throw new Error(`Firebase delete error: ${error.message}`);
     }
   }
 }
 
 // ============================================
-// TIMEFRAME MANAGER
+// TIMEFRAME MANAGER (Same as before)
 // ============================================
 class TimeframeManager {
   constructor() {
@@ -227,9 +312,9 @@ class TimeframeManager {
 }
 
 // ============================================
-// MULTI-TIMEFRAME SIMULATOR
+// ✅ SECURE MULTI-TIMEFRAME SIMULATOR
 // ============================================
-class MultiTimeframeSimulator {
+class SecureMultiTimeframeSimulator {
   constructor(config) {
     this.initialPrice = parseFloat(config.initialPrice);
     this.currentPrice = this.initialPrice;
@@ -257,28 +342,34 @@ class MultiTimeframeSimulator {
       lastWriteTime: null
     };
     
-    logger.info(`${this.assetName} Multi-Timeframe Simulator v2.1 initialized`);
-    logger.info(`Timeframes: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
+    logger.info(`${this.assetName} SECURE Multi-Timeframe Simulator v2.2 initialized`);
+    logger.info(`🔐 Authentication: Service Account`);
+    logger.info(`📊 Timeframes: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
   }
 
-  async initializeFirebase(databaseURL) {
+  async initializeFirebase(databaseURL, credentialsPath) {
     try {
-      logger.info('🔌 Initializing Firebase REST API Client...');
-      this.firebase = new FirebaseRestClient(databaseURL);
+      logger.info('🔌 Initializing SECURE Firebase REST API Client...');
+      
+      // ✅ Use secure client with authentication
+      this.firebase = new SecureFirebaseRestClient(databaseURL, credentialsPath);
       
       const assetPath = `/${this.assetName.toLowerCase()}`;
       this.basePath = assetPath;
       this.currentPricePath = `${assetPath}/current_price`;
       this.statsPath = `${assetPath}/stats`;
       
+      // Test connection with authentication
       await this.firebase.set('/test_connection', { 
-        test: 'simulator_v2.1',
+        test: 'secure_simulator_v2.2',
         timestamp: Date.now(),
-        version: '2.1-timezone-sync',
-        timezone: this.timezone
+        version: '2.2-secure-authenticated',
+        timezone: this.timezone,
+        authenticated: true
       });
       
-      logger.info('✅ Firebase connection successful!');
+      logger.info('✅ SECURE Firebase connection successful!');
+      logger.info('✅ Authentication verified');
       logger.info('✅ Multi-timeframe OHLC generation enabled');
       logger.info(`✅ Timezone: ${this.timezone} (WIB = UTC+7)`);
       return true;
@@ -311,14 +402,10 @@ class MultiTimeframeSimulator {
     return newPrice;
   }
 
-  /**
-   * ✅ UPDATED: Save to Firebase with proper timezone
-   */
   async saveToFirebase(timestamp, price) {
     try {
       const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, price);
       
-      // ✅ Use TimezoneUtil for consistent formatting
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
@@ -411,7 +498,7 @@ class MultiTimeframeSimulator {
       const uptime = this.stats.startTime ? (Date.now() - this.stats.startTime) / 1000 : 0;
       
       const statsData = {
-        version: '2.1-timezone-sync',
+        version: '2.2-secure-authenticated',
         timezone: this.timezone,
         uptime_seconds: Math.floor(uptime),
         total_iterations: this.stats.totalIterations,
@@ -422,7 +509,8 @@ class MultiTimeframeSimulator {
         timeframes: tfStats.timeframes,
         bars_created: tfStats.barsCreated,
         last_update: TimezoneUtil.toISOString(),
-        last_update_wib: TimezoneUtil.formatDateTime()
+        last_update_wib: TimezoneUtil.formatDateTime(),
+        authenticated: true
       };
       
       await this.firebase.set(this.statsPath, statsData);
@@ -463,7 +551,8 @@ class MultiTimeframeSimulator {
   async run() {
     const currentTime = TimezoneUtil.formatDateTime();
     
-    logger.info(`🚀 Starting ${this.assetName} Multi-Timeframe Simulator v2.1...`);
+    logger.info(`🚀 Starting SECURE ${this.assetName} Multi-Timeframe Simulator v2.2...`);
+    logger.info(`🔐 Authentication: Enabled (Service Account)`);
     logger.info(`🌍 Timezone: ${this.timezone} (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${currentTime}`);
     logger.info(`📊 Generating OHLC: 1s, 1m, 5m, 15m, 1h, 4h, 1d`);
@@ -516,6 +605,10 @@ class MultiTimeframeSimulator {
 // ============================================
 async function main() {
   console.log('');
+  console.log('🔐 ================================================');
+  console.log('🔐 SECURE SIMULATOR - AUTHENTICATION ENABLED');
+  console.log('🔐 ================================================');
+  console.log(`🔐 Service Account: ${process.env.FIREBASE_SERVICE_ACCOUNT || 'firebase_credentials.json'}`);
   console.log('🌍 ================================================');
   console.log('🌍 TIMEZONE CONFIGURATION');
   console.log('🌍 ================================================');
@@ -528,7 +621,7 @@ async function main() {
   console.log('🔧 System Configuration:');
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Platform: ${process.platform}`);
-  console.log(`   Mode: Fixed Multi-Timeframe v2.1 (Timezone Sync)`);
+  console.log(`   Mode: Secure Multi-Timeframe v2.2 (Authenticated)`);
   console.log('');
 
   const config = {
@@ -544,9 +637,10 @@ async function main() {
   logger.info(`  Initial Price: ${config.initialPrice}`);
   logger.info(`  Timezone: ${config.timezone}`);
   logger.info(`  Volatility: ${config.secondVolatilityMin} - ${config.secondVolatilityMax}`);
+  logger.info(`  🔐 Authentication: Service Account`);
   logger.info('');
 
-  const simulator = new MultiTimeframeSimulator(config);
+  const simulator = new SecureMultiTimeframeSimulator(config);
   
   process.on('SIGINT', () => simulator.stop());
   process.on('SIGTERM', () => simulator.stop());
@@ -564,7 +658,14 @@ async function main() {
   });
   
   try {
-    await simulator.initializeFirebase(process.env.FIREBASE_DATABASE_URL);
+    const credentialsPath = process.env.FIREBASE_SERVICE_ACCOUNT || 
+                           join(process.cwd(), 'firebase_credentials.json');
+    
+    await simulator.initializeFirebase(
+      process.env.FIREBASE_DATABASE_URL,
+      credentialsPath
+    );
+    
     await simulator.run();
   } catch (error) {
     logger.error(`❌ Fatal error: ${error.message}`);
