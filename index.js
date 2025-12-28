@@ -1,11 +1,5 @@
 // ============================================
-// MULTI-ASSET TRADING SIMULATOR v3.0
-// ============================================
-// Features:
-// - Multiple assets support
-// - Dynamic settings from Firestore
-// - Real-time OHLC generation
-// - Timezone synchronized
+// MULTI-ASSET TRADING SIMULATOR v3.1 - FIXED
 // ============================================
 
 import admin from 'firebase-admin';
@@ -14,12 +8,10 @@ import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
 
 dotenv.config();
-
-// Set timezone
 process.env.TZ = 'Asia/Jakarta';
 
 // ============================================
-// LOGGER CONFIGURATION
+// LOGGER
 // ============================================
 const logger = createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -85,7 +77,7 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE INITIALIZATION
+// FIREBASE MANAGER
 // ============================================
 class FirebaseManager {
   constructor() {
@@ -112,16 +104,15 @@ class FirebaseManager {
       this.db = admin.firestore();
       this.realtimeDb = admin.database();
 
-      // REST client for Realtime DB (faster) - WITH BETTER TIMEOUT
+      // REST client with proper timeout
       const baseURL = process.env.FIREBASE_REALTIME_DB_URL.replace(/\/$/, '');
       this.restClient = axios.create({
         baseURL,
-        timeout: 10000, // 10 seconds
+        timeout: 5000,
         headers: { 
           'Content-Type': 'application/json',
           'Accept': 'application/json'
-        },
-        validateStatus: (status) => status >= 200 && status < 500 // Don't throw on 4xx
+        }
       });
 
       logger.info('✅ Firebase initialized successfully');
@@ -160,45 +151,33 @@ class FirebaseManager {
 
   async setRealtimeValue(path, data) {
     try {
+      // ✅ FIX: Path sudah lengkap dari caller, tinggal tambah .json
       const fullPath = `${path}.json`;
-      
-      logger.debug(`Writing to: ${fullPath}`);
       
       const response = await this.restClient.put(fullPath, data);
       
-      // Check response
       if (response.status >= 200 && response.status < 300) {
-        logger.debug(`✅ Write success: ${path} (${response.status})`);
         return response.data;
       } else {
         throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.data)}`);
       }
       
     } catch (error) {
-      // DETAILED ERROR LOGGING
       if (error.response) {
-        // Server responded with error
-        logger.error(`❌ Firebase write error (HTTP ${error.response.status})`);
-        logger.error(`   Path: ${path}`);
-        logger.error(`   Status: ${error.response.status} ${error.response.statusText}`);
+        logger.error(`❌ Write failed (HTTP ${error.response.status}): ${path}`);
         logger.error(`   Response: ${JSON.stringify(error.response.data)}`);
-        logger.error(`   Headers: ${JSON.stringify(error.response.headers)}`);
       } else if (error.request) {
-        // No response received
-        logger.error(`❌ Firebase write error: No response`);
-        logger.error(`   Path: ${path}`);
-        logger.error(`   Request: ${error.message}`);
-        logger.error(`   Code: ${error.code}`);
+        logger.error(`❌ Write failed (No response): ${path}`);
+        logger.error(`   Error: ${error.message}`);
       } else {
-        // Other error
-        logger.error(`❌ Firebase write error: ${error.message}`);
-        logger.error(`   Path: ${path}`);
-        logger.error(`   Stack: ${error.stack}`);
+        logger.error(`❌ Write failed: ${path}`);
+        logger.error(`   Error: ${error.message}`);
       }
       throw error;
     }
   }
 }
+
 // ============================================
 // TIMEFRAME MANAGER
 // ============================================
@@ -289,7 +268,6 @@ class AssetSimulator {
     this.firebase = firebaseManager;
     this.tfManager = new TimeframeManager();
 
-    // Get settings from asset or use defaults
     const settings = asset.simulatorSettings || {};
     
     this.initialPrice = settings.initialPrice || 40.022;
@@ -302,19 +280,17 @@ class AssetSimulator {
     this.lastDirection = 1;
     this.iteration = 0;
 
-    // Realtime DB path
-    if (asset.dataSource === 'realtime_db') {
-      this.realtimeDbPath = asset.realtimeDbPath;
+    // ✅ FIX: Set base path correctly
+    if (asset.dataSource === 'realtime_db' && asset.realtimeDbPath) {
+      this.basePath = asset.realtimeDbPath;
     } else {
-      // For mock assets, use /mock/{symbol}
-      this.realtimeDbPath = `/mock/${asset.symbol.toLowerCase()}`;
+      this.basePath = `/mock/${asset.symbol.toLowerCase()}`;
     }
 
     logger.info(`✅ Simulator initialized for ${asset.symbol}`);
     logger.info(`   Initial Price: ${this.initialPrice}`);
     logger.info(`   Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
-    logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
-    logger.info(`   Path: ${this.realtimeDbPath}`);
+    logger.info(`   Base Path: ${this.basePath}`);
   }
 
   generatePriceMovement() {
@@ -330,7 +306,6 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // Apply limits
     if (newPrice < this.minPrice) newPrice = this.minPrice;
     if (newPrice > this.maxPrice) newPrice = this.maxPrice;
     
@@ -342,13 +317,12 @@ class AssetSimulator {
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
       
-      // Update OHLC
       const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, newPrice);
       
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // Save current price
+      // ✅ FIX: Correct path - no duplication
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -358,12 +332,13 @@ class AssetSimulator {
         change: parseFloat(((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
       };
       
+      // ✅ FIX: Write to correct path
       await this.firebase.setRealtimeValue(
-        `${this.realtimeDbPath}/current_price`,
+        `${this.basePath}/current_price`,
         currentPriceData
       );
 
-      // Save completed bars (if any)
+      // Save completed bars
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -381,8 +356,9 @@ class AssetSimulator {
           isCompleted: true
         };
         
+        // ✅ FIX: Correct path for OHLC bars
         await this.firebase.setRealtimeValue(
-          `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
+          `${this.basePath}/ohlc_${tf}/${bar.timestamp}`,
           barData
         );
       }
@@ -390,10 +366,16 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
+      // Log every 10 iterations
+      if (this.iteration % 10 === 0) {
+        const change = ((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2);
+        logger.info(`[${this.asset.symbol}] Iteration ${this.iteration}: ${newPrice.toFixed(6)} (${change > 0 ? '+' : ''}${change}%)`);
+      }
+
       // Log completed bars
       if (Object.keys(completedBars).length > 0) {
         const completedTfs = Object.keys(completedBars).join(', ');
-        logger.debug(`[${this.asset.symbol}] Completed: ${completedTfs} | Price: ${newPrice.toFixed(6)}`);
+        logger.debug(`[${this.asset.symbol}] Completed bars: ${completedTfs}`);
       }
 
     } catch (error) {
@@ -404,31 +386,10 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
-    // Only update if settings changed
-    const oldSettings = JSON.stringify({
-      volatilityMin: this.volatilityMin,
-      volatilityMax: this.volatilityMax,
-      minPrice: this.minPrice,
-      maxPrice: this.maxPrice
-    });
-
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     this.minPrice = settings.minPrice || this.minPrice;
     this.maxPrice = settings.maxPrice || this.maxPrice;
-
-    const newSettings = JSON.stringify({
-      volatilityMin: this.volatilityMin,
-      volatilityMax: this.volatilityMax,
-      minPrice: this.minPrice,
-      maxPrice: this.maxPrice
-    });
-
-    if (oldSettings !== newSettings) {
-      logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
-      logger.info(`   Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
-      logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
-    }
 
     this.asset = newAsset;
   }
@@ -452,7 +413,7 @@ class MultiAssetManager {
     const assets = await this.firebase.getAssets();
     
     if (assets.length === 0) {
-      logger.warn('⚠️ No active assets found. Waiting...');
+      logger.warn('⚠️  No active assets found. Waiting...');
       return;
     }
 
@@ -472,23 +433,20 @@ class MultiAssetManager {
       const currentIds = new Set(this.simulators.keys());
       const newIds = new Set(assets.map(a => a.id));
 
-      // Remove simulators for inactive assets
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
-          logger.info(`🗑️ Removing simulator for ${simulator.asset.symbol}`);
+          logger.info(`🗑️  Removing simulator for ${simulator.asset.symbol}`);
           this.simulators.delete(id);
         }
       }
 
-      // Add simulators for new assets
       for (const asset of assets) {
         if (!currentIds.has(asset.id)) {
           logger.info(`➕ Adding simulator for ${asset.symbol}`);
           const simulator = new AssetSimulator(asset, this.firebase);
           this.simulators.set(asset.id, simulator);
         } else {
-          // Update settings for existing simulators
           const simulator = this.simulators.get(asset.id);
           simulator.updateSettings(asset);
         }
@@ -501,13 +459,14 @@ class MultiAssetManager {
   }
 
   async updateAllPrices() {
-    if (this.simulators.size === 0) {
-      return;
-    }
+    if (this.simulators.size === 0) return;
 
     const promises = [];
     for (const simulator of this.simulators.values()) {
-      promises.push(simulator.updatePrice());
+      promises.push(
+        simulator.updatePrice()
+          .catch(err => logger.error(`Update failed: ${err.message}`))
+      );
     }
 
     await Promise.allSettled(promises);
@@ -515,14 +474,14 @@ class MultiAssetManager {
 
   async start() {
     if (this.isRunning) {
-      logger.warn('⚠️ Manager already running');
+      logger.warn('⚠️  Manager already running');
       return;
     }
 
     await this.initialize();
 
     if (this.simulators.size === 0) {
-      logger.warn('⚠️ No simulators to start. Will retry in 10 seconds...');
+      logger.warn('⚠️  No simulators to start. Will retry in 10 seconds...');
       setTimeout(() => this.start(), 10000);
       return;
     }
@@ -532,7 +491,7 @@ class MultiAssetManager {
     const currentTime = TimezoneUtil.formatDateTime();
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v3.0 STARTED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v3.1 STARTED');
     logger.info('🚀 ================================================');
     logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${currentTime}`);
@@ -542,18 +501,19 @@ class MultiAssetManager {
     logger.info('🚀 ================================================');
     logger.info('');
 
-    // List assets
     for (const simulator of this.simulators.values()) {
       logger.info(`   📈 ${simulator.asset.symbol} - ${simulator.asset.name}`);
     }
     logger.info('');
 
-    // Start price updates (every second)
     this.updateInterval = setInterval(async () => {
-      await this.updateAllPrices();
+      try {
+        await this.updateAllPrices();
+      } catch (error) {
+        logger.error(`Update interval error: ${error.message}`);
+      }
     }, parseInt(process.env.UPDATE_INTERVAL_MS || 1000));
 
-    // Start settings refresh (every 60 seconds)
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
     }, parseInt(process.env.SETTINGS_REFRESH_INTERVAL_MS || 60000));
@@ -596,7 +556,7 @@ class MultiAssetManager {
 }
 
 // ============================================
-// MAIN EXECUTION
+// MAIN
 // ============================================
 async function main() {
   console.log('');
@@ -609,11 +569,6 @@ async function main() {
   console.log(`🌍 Unix Timestamp: ${TimezoneUtil.getCurrentTimestamp()}`);
   console.log('🌍 ================================================');
   console.log('');
-  console.log('🔧 System Configuration:');
-  console.log(`   Node.js: ${process.version}`);
-  console.log(`   Platform: ${process.platform}`);
-  console.log(`   Mode: Multi-Asset Dynamic Simulator v3.0`);
-  console.log('');
 
   try {
     const firebaseManager = new FirebaseManager();
@@ -621,7 +576,6 @@ async function main() {
 
     const manager = new MultiAssetManager(firebaseManager);
     
-    // Handle shutdown
     process.on('SIGINT', () => manager.stop());
     process.on('SIGTERM', () => manager.stop());
     process.on('SIGUSR2', () => manager.stop());
@@ -633,7 +587,7 @@ async function main() {
     });
     
     process.on('unhandledRejection', (reason, promise) => {
-      logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+      logger.error(`Unhandled Rejection: ${reason}`);
       manager.stop();
     });
 
