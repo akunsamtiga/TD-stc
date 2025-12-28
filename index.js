@@ -112,15 +112,20 @@ class FirebaseManager {
       this.db = admin.firestore();
       this.realtimeDb = admin.database();
 
-      // REST client for Realtime DB (faster)
+      // REST client for Realtime DB (faster) - WITH BETTER TIMEOUT
       const baseURL = process.env.FIREBASE_REALTIME_DB_URL.replace(/\/$/, '');
       this.restClient = axios.create({
         baseURL,
-        timeout: 5000,
-        headers: { 'Content-Type': 'application/json' }
+        timeout: 10000, // 10 seconds
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        validateStatus: (status) => status >= 200 && status < 500 // Don't throw on 4xx
       });
 
       logger.info('✅ Firebase initialized successfully');
+      logger.info(`   Database URL: ${baseURL}`);
       return true;
     } catch (error) {
       logger.error(`❌ Firebase initialization error: ${error.message}`);
@@ -138,7 +143,6 @@ class FirebaseManager {
       snapshot.forEach(doc => {
         const data = doc.data();
         
-        // Only include assets with realtime_db or mock data source
         if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
           assets.push({
             id: doc.id,
@@ -156,14 +160,45 @@ class FirebaseManager {
 
   async setRealtimeValue(path, data) {
     try {
-      await this.restClient.put(`${path}.json`, data);
+      const fullPath = `${path}.json`;
+      
+      logger.debug(`Writing to: ${fullPath}`);
+      
+      const response = await this.restClient.put(fullPath, data);
+      
+      // Check response
+      if (response.status >= 200 && response.status < 300) {
+        logger.debug(`✅ Write success: ${path} (${response.status})`);
+        return response.data;
+      } else {
+        throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.data)}`);
+      }
+      
     } catch (error) {
-      logger.error(`Error setting realtime value: ${error.message}`);
+      // DETAILED ERROR LOGGING
+      if (error.response) {
+        // Server responded with error
+        logger.error(`❌ Firebase write error (HTTP ${error.response.status})`);
+        logger.error(`   Path: ${path}`);
+        logger.error(`   Status: ${error.response.status} ${error.response.statusText}`);
+        logger.error(`   Response: ${JSON.stringify(error.response.data)}`);
+        logger.error(`   Headers: ${JSON.stringify(error.response.headers)}`);
+      } else if (error.request) {
+        // No response received
+        logger.error(`❌ Firebase write error: No response`);
+        logger.error(`   Path: ${path}`);
+        logger.error(`   Request: ${error.message}`);
+        logger.error(`   Code: ${error.code}`);
+      } else {
+        // Other error
+        logger.error(`❌ Firebase write error: ${error.message}`);
+        logger.error(`   Path: ${path}`);
+        logger.error(`   Stack: ${error.stack}`);
+      }
       throw error;
     }
   }
 }
-
 // ============================================
 // TIMEFRAME MANAGER
 // ============================================
