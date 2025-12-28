@@ -1,12 +1,6 @@
 // ============================================
 // MULTI-ASSET TRADING SIMULATOR v3.0
 // ============================================
-// Features:
-// - Multiple assets support
-// - Dynamic settings from Firestore
-// - Real-time OHLC generation
-// - Timezone synchronized
-// ============================================
 
 import admin from 'firebase-admin';
 import axios from 'axios';
@@ -113,7 +107,13 @@ class FirebaseManager {
       this.realtimeDb = admin.database();
 
       // REST client for Realtime DB (faster)
-      const baseURL = process.env.FIREBASE_REALTIME_DB_URL.replace(/\/$/, '');
+      const realtimeDbUrl = process.env.FIREBASE_REALTIME_DB_URL;
+      
+      if (!realtimeDbUrl) {
+        throw new Error('FIREBASE_REALTIME_DB_URL not set in environment');
+      }
+
+      const baseURL = realtimeDbUrl.replace(/\/$/, '');
       this.restClient = axios.create({
         baseURL,
         timeout: 5000,
@@ -138,7 +138,6 @@ class FirebaseManager {
       snapshot.forEach(doc => {
         const data = doc.data();
         
-        // Only include assets with realtime_db or mock data source
         if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
           assets.push({
             id: doc.id,
@@ -254,7 +253,6 @@ class AssetSimulator {
     this.firebase = firebaseManager;
     this.tfManager = new TimeframeManager();
 
-    // Get settings from asset or use defaults
     const settings = asset.simulatorSettings || {};
     
     this.initialPrice = settings.initialPrice || 40.022;
@@ -267,11 +265,9 @@ class AssetSimulator {
     this.lastDirection = 1;
     this.iteration = 0;
 
-    // Realtime DB path
     if (asset.dataSource === 'realtime_db') {
       this.realtimeDbPath = asset.realtimeDbPath;
     } else {
-      // For mock assets, use /mock/{symbol}
       this.realtimeDbPath = `/mock/${asset.symbol.toLowerCase()}`;
     }
 
@@ -295,7 +291,6 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // Apply limits
     if (newPrice < this.minPrice) newPrice = this.minPrice;
     if (newPrice > this.maxPrice) newPrice = this.maxPrice;
     
@@ -307,13 +302,11 @@ class AssetSimulator {
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
       
-      // Update OHLC
       const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, newPrice);
       
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // Save current price
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -328,7 +321,6 @@ class AssetSimulator {
         currentPriceData
       );
 
-      // Save completed bars (if any)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -355,7 +347,6 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
-      // Log completed bars
       if (Object.keys(completedBars).length > 0) {
         const completedTfs = Object.keys(completedBars).join(', ');
         logger.debug(`[${this.asset.symbol}] Completed: ${completedTfs} | Price: ${newPrice.toFixed(6)}`);
@@ -369,31 +360,10 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
-    // Only update if settings changed
-    const oldSettings = JSON.stringify({
-      volatilityMin: this.volatilityMin,
-      volatilityMax: this.volatilityMax,
-      minPrice: this.minPrice,
-      maxPrice: this.maxPrice
-    });
-
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     this.minPrice = settings.minPrice || this.minPrice;
     this.maxPrice = settings.maxPrice || this.maxPrice;
-
-    const newSettings = JSON.stringify({
-      volatilityMin: this.volatilityMin,
-      volatilityMax: this.volatilityMax,
-      minPrice: this.minPrice,
-      maxPrice: this.maxPrice
-    });
-
-    if (oldSettings !== newSettings) {
-      logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
-      logger.info(`   Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
-      logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
-    }
 
     this.asset = newAsset;
   }
@@ -437,7 +407,6 @@ class MultiAssetManager {
       const currentIds = new Set(this.simulators.keys());
       const newIds = new Set(assets.map(a => a.id));
 
-      // Remove simulators for inactive assets
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
@@ -446,14 +415,12 @@ class MultiAssetManager {
         }
       }
 
-      // Add simulators for new assets
       for (const asset of assets) {
         if (!currentIds.has(asset.id)) {
           logger.info(`➕ Adding simulator for ${asset.symbol}`);
           const simulator = new AssetSimulator(asset, this.firebase);
           this.simulators.set(asset.id, simulator);
         } else {
-          // Update settings for existing simulators
           const simulator = this.simulators.get(asset.id);
           simulator.updateSettings(asset);
         }
@@ -507,18 +474,15 @@ class MultiAssetManager {
     logger.info('🚀 ================================================');
     logger.info('');
 
-    // List assets
     for (const simulator of this.simulators.values()) {
       logger.info(`   📈 ${simulator.asset.symbol} - ${simulator.asset.name}`);
     }
     logger.info('');
 
-    // Start price updates (every second)
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, parseInt(process.env.UPDATE_INTERVAL_MS || 1000));
 
-    // Start settings refresh (every 60 seconds)
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
     }, parseInt(process.env.SETTINGS_REFRESH_INTERVAL_MS || 60000));
@@ -586,7 +550,6 @@ async function main() {
 
     const manager = new MultiAssetManager(firebaseManager);
     
-    // Handle shutdown
     process.on('SIGINT', () => manager.stop());
     process.on('SIGTERM', () => manager.stop());
     process.on('SIGUSR2', () => manager.stop());
