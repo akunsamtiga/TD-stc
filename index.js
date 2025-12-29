@@ -1,5 +1,5 @@
 // ============================================
-// MULTI-ASSET TRADING SIMULATOR v3.1 - FIXED
+// MULTI-ASSET TRADING SIMULATOR v3.2 - FIXED TIMEOUT
 // ============================================
 
 import admin from 'firebase-admin';
@@ -25,8 +25,7 @@ const logger = createLogger({
     new transports.File({ 
       filename: 'simulator.log',
       maxsize: 5242880,
-      maxFiles: 3,
-      tailable: true
+      maxFiles: 3
     }),
     new transports.Console({
       format: format.combine(
@@ -77,13 +76,16 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE MANAGER
+// FIREBASE MANAGER - IMPROVED
 // ============================================
 class FirebaseManager {
   constructor() {
     this.db = null;
     this.realtimeDb = null;
     this.restClient = null;
+    this.writeQueue = [];
+    this.isProcessingQueue = false;
+    this.writeStats = { success: 0, failed: 0 };
   }
 
   async initialize() {
@@ -104,19 +106,25 @@ class FirebaseManager {
       this.db = admin.firestore();
       this.realtimeDb = admin.database();
 
-      // REST client with proper timeout
+      // ✅ IMPROVED: Increased timeout & better config
       const baseURL = process.env.FIREBASE_REALTIME_DB_URL.replace(/\/$/, '');
       this.restClient = axios.create({
         baseURL,
-        timeout: 5000,
+        timeout: 10000, // ✅ 10 seconds (was 5s)
         headers: { 
           'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        }
+          'Connection': 'keep-alive'
+        },
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 300
       });
 
       logger.info('✅ Firebase initialized successfully');
       logger.info(`   Database URL: ${baseURL}`);
+      
+      // Start queue processor
+      this.startQueueProcessor();
+      
       return true;
     } catch (error) {
       logger.error(`❌ Firebase initialization error: ${error.message}`);
@@ -149,32 +157,65 @@ class FirebaseManager {
     }
   }
 
-  async setRealtimeValue(path, data) {
-    try {
-      // ✅ FIX: Path sudah lengkap dari caller, tinggal tambah .json
-      const fullPath = `${path}.json`;
-      
-      const response = await this.restClient.put(fullPath, data);
-      
-      if (response.status >= 200 && response.status < 300) {
-        return response.data;
-      } else {
-        throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.data)}`);
+  // ✅ NEW: Write with retry logic
+  async setRealtimeValue(path, data, retries = 3) {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        await this.restClient.put(`${path}.json`, data);
+        this.writeStats.success++;
+        
+        if (attempt > 0) {
+          logger.debug(`✅ Write succeeded on retry ${attempt}: ${path}`);
+        }
+        
+        return true;
+      } catch (error) {
+        if (attempt < retries - 1) {
+          const delay = 500 * (attempt + 1); // 500ms, 1000ms, 1500ms
+          logger.warn(`⚠️ Write failed (attempt ${attempt + 1}/${retries}): ${path}, retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          logger.error(`❌ Write failed after ${retries} attempts: ${path}`);
+          logger.error(`   Error: ${error.message}`);
+          this.writeStats.failed++;
+          return false;
+        }
       }
-      
-    } catch (error) {
-      if (error.response) {
-        logger.error(`❌ Write failed (HTTP ${error.response.status}): ${path}`);
-        logger.error(`   Response: ${JSON.stringify(error.response.data)}`);
-      } else if (error.request) {
-        logger.error(`❌ Write failed (No response): ${path}`);
-        logger.error(`   Error: ${error.message}`);
-      } else {
-        logger.error(`❌ Write failed: ${path}`);
-        logger.error(`   Error: ${error.message}`);
-      }
-      throw error;
     }
+    return false;
+  }
+
+  // ✅ NEW: Async write queue for non-critical data
+  async setRealtimeValueAsync(path, data) {
+    this.writeQueue.push({ path, data });
+  }
+
+  // ✅ NEW: Process write queue in background
+  async startQueueProcessor() {
+    setInterval(async () => {
+      if (this.isProcessingQueue || this.writeQueue.length === 0) return;
+      
+      this.isProcessingQueue = true;
+      
+      const batch = this.writeQueue.splice(0, 5); // Process 5 at a time
+      
+      await Promise.allSettled(
+        batch.map(({ path, data }) => this.setRealtimeValue(path, data, 2))
+      );
+      
+      this.isProcessingQueue = false;
+    }, 100); // Every 100ms
+  }
+
+  getStats() {
+    return {
+      success: this.writeStats.success,
+      failed: this.writeStats.failed,
+      queueSize: this.writeQueue.length,
+      successRate: this.writeStats.success > 0 
+        ? Math.round((this.writeStats.success / (this.writeStats.success + this.writeStats.failed)) * 100)
+        : 0
+    };
   }
 }
 
@@ -260,7 +301,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR
+// ASSET SIMULATOR - IMPROVED
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -279,18 +320,19 @@ class AssetSimulator {
     
     this.lastDirection = 1;
     this.iteration = 0;
+    this.lastLogTime = 0;
 
-    // ✅ FIX: Set base path correctly
-    if (asset.dataSource === 'realtime_db' && asset.realtimeDbPath) {
-      this.basePath = asset.realtimeDbPath;
+    if (asset.dataSource === 'realtime_db') {
+      this.realtimeDbPath = asset.realtimeDbPath;
     } else {
-      this.basePath = `/mock/${asset.symbol.toLowerCase()}`;
+      this.realtimeDbPath = `/mock/${asset.symbol.toLowerCase()}`;
     }
 
     logger.info(`✅ Simulator initialized for ${asset.symbol}`);
     logger.info(`   Initial Price: ${this.initialPrice}`);
     logger.info(`   Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
-    logger.info(`   Base Path: ${this.basePath}`);
+    logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
+    logger.info(`   Path: ${this.realtimeDbPath}`);
   }
 
   generatePriceMovement() {
@@ -322,7 +364,7 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ FIX: Correct path - no duplication
+      // ✅ CRITICAL: Save current price first (most important)
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -332,13 +374,18 @@ class AssetSimulator {
         change: parseFloat(((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
       };
       
-      // ✅ FIX: Write to correct path
-      await this.firebase.setRealtimeValue(
-        `${this.basePath}/current_price`,
-        currentPriceData
+      // ✅ IMPROVED: Use async for OHLC bars (less critical)
+      const writePromises = [];
+      
+      // Current price - synchronous (most critical)
+      writePromises.push(
+        this.firebase.setRealtimeValue(
+          `${this.realtimeDbPath}/current_price`,
+          currentPriceData
+        )
       );
 
-      // Save completed bars
+      // OHLC bars - can be async
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -356,26 +403,36 @@ class AssetSimulator {
           isCompleted: true
         };
         
-        // ✅ FIX: Correct path for OHLC bars
-        await this.firebase.setRealtimeValue(
-          `${this.basePath}/ohlc_${tf}/${bar.timestamp}`,
+        // Use async write for OHLC (less critical)
+        this.firebase.setRealtimeValueAsync(
+          `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
         );
       }
 
+      // Wait only for current price write
+      await Promise.race([
+        Promise.all(writePromises),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Write timeout')), 8000)
+        )
+      ]);
+
       this.currentPrice = newPrice;
       this.iteration++;
 
-      // Log every 10 iterations
-      if (this.iteration % 10 === 0) {
-        const change = ((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2);
-        logger.info(`[${this.asset.symbol}] Iteration ${this.iteration}: ${newPrice.toFixed(6)} (${change > 0 ? '+' : ''}${change}%)`);
+      // ✅ Log every 10 seconds instead of every update
+      const now = Date.now();
+      if (now - this.lastLogTime > 10000) {
+        const stats = this.firebase.getStats();
+        logger.info(`[${this.asset.symbol}] Iteration ${this.iteration}: ${newPrice.toFixed(6)} (${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%) | Write success rate: ${stats.successRate}%`);
+        this.lastLogTime = now;
       }
 
       // Log completed bars
       if (Object.keys(completedBars).length > 0) {
         const completedTfs = Object.keys(completedBars).join(', ');
-        logger.debug(`[${this.asset.symbol}] Completed bars: ${completedTfs}`);
+        logger.debug(`[${this.asset.symbol}] Completed: ${completedTfs}`);
       }
 
     } catch (error) {
@@ -386,17 +443,37 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
+    const oldSettings = JSON.stringify({
+      volatilityMin: this.volatilityMin,
+      volatilityMax: this.volatilityMax,
+      minPrice: this.minPrice,
+      maxPrice: this.maxPrice
+    });
+
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     this.minPrice = settings.minPrice || this.minPrice;
     this.maxPrice = settings.maxPrice || this.maxPrice;
+
+    const newSettings = JSON.stringify({
+      volatilityMin: this.volatilityMin,
+      volatilityMax: this.volatilityMax,
+      minPrice: this.minPrice,
+      maxPrice: this.maxPrice
+    });
+
+    if (oldSettings !== newSettings) {
+      logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
+      logger.info(`   Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
+      logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
+    }
 
     this.asset = newAsset;
   }
 }
 
 // ============================================
-// MULTI-ASSET MANAGER
+// MULTI-ASSET MANAGER - IMPROVED
 // ============================================
 class MultiAssetManager {
   constructor(firebaseManager) {
@@ -404,6 +481,7 @@ class MultiAssetManager {
     this.simulators = new Map();
     this.updateInterval = null;
     this.settingsRefreshInterval = null;
+    this.statsInterval = null;
     this.isRunning = false;
   }
 
@@ -413,7 +491,7 @@ class MultiAssetManager {
     const assets = await this.firebase.getAssets();
     
     if (assets.length === 0) {
-      logger.warn('⚠️  No active assets found. Waiting...');
+      logger.warn('⚠️ No active assets found. Waiting...');
       return;
     }
 
@@ -436,7 +514,7 @@ class MultiAssetManager {
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
-          logger.info(`🗑️  Removing simulator for ${simulator.asset.symbol}`);
+          logger.info(`🗑️ Removing simulator for ${simulator.asset.symbol}`);
           this.simulators.delete(id);
         }
       }
@@ -459,14 +537,13 @@ class MultiAssetManager {
   }
 
   async updateAllPrices() {
-    if (this.simulators.size === 0) return;
+    if (this.simulators.size === 0) {
+      return;
+    }
 
     const promises = [];
     for (const simulator of this.simulators.values()) {
-      promises.push(
-        simulator.updatePrice()
-          .catch(err => logger.error(`Update failed: ${err.message}`))
-      );
+      promises.push(simulator.updatePrice());
     }
 
     await Promise.allSettled(promises);
@@ -474,14 +551,14 @@ class MultiAssetManager {
 
   async start() {
     if (this.isRunning) {
-      logger.warn('⚠️  Manager already running');
+      logger.warn('⚠️ Manager already running');
       return;
     }
 
     await this.initialize();
 
     if (this.simulators.size === 0) {
-      logger.warn('⚠️  No simulators to start. Will retry in 10 seconds...');
+      logger.warn('⚠️ No simulators to start. Will retry in 10 seconds...');
       setTimeout(() => this.start(), 10000);
       return;
     }
@@ -491,7 +568,7 @@ class MultiAssetManager {
     const currentTime = TimezoneUtil.formatDateTime();
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v3.1 STARTED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v3.2 STARTED');
     logger.info('🚀 ================================================');
     logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${currentTime}`);
@@ -506,17 +583,21 @@ class MultiAssetManager {
     }
     logger.info('');
 
+    // Price updates
     this.updateInterval = setInterval(async () => {
-      try {
-        await this.updateAllPrices();
-      } catch (error) {
-        logger.error(`Update interval error: ${error.message}`);
-      }
+      await this.updateAllPrices();
     }, parseInt(process.env.UPDATE_INTERVAL_MS || 1000));
 
+    // Settings refresh
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
     }, parseInt(process.env.SETTINGS_REFRESH_INTERVAL_MS || 60000));
+
+    // ✅ NEW: Stats logging every 30 seconds
+    this.statsInterval = setInterval(() => {
+      const stats = this.firebase.getStats();
+      logger.info(`📊 Write Stats: Success: ${stats.success}, Failed: ${stats.failed}, Queue: ${stats.queueSize}, Rate: ${stats.successRate}%`);
+    }, 30000);
 
     logger.info('✅ All simulators running!');
     logger.info('Press Ctrl+C to stop');
@@ -541,10 +622,18 @@ class MultiAssetManager {
       this.settingsRefreshInterval = null;
     }
 
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+      this.statsInterval = null;
+    }
+
     logger.info('📊 Final Statistics:');
+    const stats = this.firebase.getStats();
+    logger.info(`   Write Stats: Success: ${stats.success}, Failed: ${stats.failed}, Success Rate: ${stats.successRate}%`);
+    
     for (const simulator of this.simulators.values()) {
-      const stats = simulator.tfManager.getStatistics();
-      logger.info(`   ${simulator.asset.symbol}: ${simulator.iteration} iterations, Bars: ${JSON.stringify(stats.barsCreated)}`);
+      const tfStats = simulator.tfManager.getStatistics();
+      logger.info(`   ${simulator.asset.symbol}: ${simulator.iteration} iterations, Bars: ${JSON.stringify(tfStats.barsCreated)}`);
     }
 
     logger.info('✅ Multi-Asset Manager stopped gracefully');
@@ -587,7 +676,7 @@ async function main() {
     });
     
     process.on('unhandledRejection', (reason, promise) => {
-      logger.error(`Unhandled Rejection: ${reason}`);
+      logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
       manager.stop();
     });
 
