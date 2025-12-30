@@ -1,13 +1,12 @@
 // ============================================
-// OPTIMIZED SIMULATOR v4.0 - FIXED BILLING ISSUE
+// PRODUCTION SIMULATOR v5.0 - ADMIN SDK
 // ============================================
+// ✅ Uses Admin SDK (bypasses rules)
+// ✅ Ultra secure for production
 // ✅ Auto-cleanup old data
 // ✅ Reduced OHLC timeframes
-// ✅ Batched writes
-// ✅ Retention policy
 
 import admin from 'firebase-admin';
-import axios from 'axios';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
 
@@ -64,20 +63,19 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE MANAGER - OPTIMIZED
+// FIREBASE MANAGER - ADMIN SDK (PRODUCTION)
 // ============================================
 class FirebaseManager {
   constructor() {
     this.db = null;
-    this.restClient = null;
+    this.realtimeDbAdmin = null; // ✅ Admin SDK for Realtime DB
     this.writeQueue = [];
     this.isProcessingQueue = false;
     this.writeStats = { success: 0, failed: 0 };
     
-    // ✅ CLEANUP CONFIG
-    this.RETENTION_DAYS = 7; // Keep only 7 days of data
+    this.RETENTION_DAYS = 7;
     this.lastCleanupTime = 0;
-    this.CLEANUP_INTERVAL = 3600000; // Cleanup every 1 hour
+    this.CLEANUP_INTERVAL = 3600000;
   }
 
   async initialize() {
@@ -88,28 +86,28 @@ class FirebaseManager {
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
       };
 
+      if (!serviceAccount.projectId || !serviceAccount.privateKey || !serviceAccount.clientEmail) {
+        throw new Error('Firebase credentials incomplete in .env');
+      }
+
       if (!admin.apps.length) {
         admin.initializeApp({
           credential: admin.credential.cert(serviceAccount),
-          databaseURL: process.env.FIREBASE_REALTIME_DB_URL,
+          databaseURL: process.env.FIREBASE_REALTIME_DB_URL, // ✅ IMPORTANT
         });
       }
 
       this.db = admin.firestore();
-
-      const baseURL = process.env.FIREBASE_REALTIME_DB_URL.replace(/\/$/, '');
-      this.restClient = axios.create({
-        baseURL,
-        timeout: 5000,
-        headers: { 'Content-Type': 'application/json', 'Connection': 'keep-alive' },
-        maxRedirects: 0,
-        validateStatus: (status) => status >= 200 && status < 300
-      });
-
-      logger.info('✅ Firebase initialized successfully');
+      
+      // ✅ PRODUCTION: Use Admin SDK for Realtime DB
+      this.realtimeDbAdmin = admin.database();
+      
+      logger.info('✅ Firebase Admin SDK initialized successfully');
+      logger.info('✅ Firestore ready');
+      logger.info('✅ Realtime DB Admin SDK ready (bypasses all rules)');
       
       this.startQueueProcessor();
-      this.startCleanupScheduler(); // ✅ NEW
+      this.startCleanupScheduler();
       
       return true;
     } catch (error) {
@@ -139,15 +137,22 @@ class FirebaseManager {
     }
   }
 
+  // ✅ PRODUCTION: Get last price using Admin SDK
   async getLastPrice(path) {
     try {
-      const response = await this.restClient.get(`${path}/current_price.json`);
+      if (!this.realtimeDbAdmin) {
+        logger.error('Realtime DB Admin not initialized');
+        return null;
+      }
+
+      const snapshot = await this.realtimeDbAdmin.ref(`${path}/current_price`).once('value');
+      const data = snapshot.val();
       
-      if (response.data && response.data.price) {
+      if (data && data.price) {
         return {
-          price: parseFloat(response.data.price),
-          timestamp: response.data.timestamp || TimezoneUtil.getCurrentTimestamp(),
-          datetime: response.data.datetime || TimezoneUtil.formatDateTime()
+          price: parseFloat(data.price),
+          timestamp: data.timestamp || TimezoneUtil.getCurrentTimestamp(),
+          datetime: data.datetime || TimezoneUtil.formatDateTime()
         };
       }
       
@@ -158,10 +163,18 @@ class FirebaseManager {
     }
   }
 
+  // ✅ PRODUCTION: Write using Admin SDK (bypasses rules)
   async setRealtimeValue(path, data, retries = 2) {
+    if (!this.realtimeDbAdmin) {
+      logger.error('Realtime DB Admin not initialized');
+      this.writeStats.failed++;
+      return false;
+    }
+
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        await this.restClient.put(`${path}.json`, data);
+        // ✅ Admin SDK bypasses all rules!
+        await this.realtimeDbAdmin.ref(path).set(data);
         this.writeStats.success++;
         return true;
       } catch (error) {
@@ -169,6 +182,7 @@ class FirebaseManager {
           await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
         } else {
           this.writeStats.failed++;
+          logger.error(`Write failed at ${path}: ${error.message}`);
           return false;
         }
       }
@@ -195,7 +209,7 @@ class FirebaseManager {
     }, 200);
   }
 
-  // ✅ NEW: AUTO CLEANUP OLD DATA
+  // ✅ AUTO CLEANUP OLD DATA
   async startCleanupScheduler() {
     setInterval(async () => {
       const now = Date.now();
@@ -216,24 +230,24 @@ class FirebaseManager {
             ? asset.realtimeDbPath 
             : `/mock/${asset.symbol.toLowerCase()}`;
           
-          // ✅ Cleanup old OHLC data
           const timeframes = ['1m', '5m', '15m', '1h'];
           
           for (const tf of timeframes) {
             try {
-              const response = await this.restClient.get(`${path}/ohlc_${tf}.json`);
+              const snapshot = await this.realtimeDbAdmin.ref(`${path}/ohlc_${tf}`).once('value');
+              const data = snapshot.val();
               
-              if (response.data) {
-                const oldKeys = Object.keys(response.data).filter(timestamp => {
+              if (data) {
+                const oldKeys = Object.keys(data).filter(timestamp => {
                   return parseInt(timestamp) < cutoffTimestamp;
                 });
 
                 if (oldKeys.length > 0) {
                   logger.info(`  🗑️ Deleting ${oldKeys.length} old ${tf} bars for ${asset.symbol}`);
                   
-                  // Delete in batches
+                  // Delete using Admin SDK
                   for (const key of oldKeys) {
-                    await this.restClient.delete(`${path}/ohlc_${tf}/${key}.json`);
+                    await this.realtimeDbAdmin.ref(`${path}/ohlc_${tf}/${key}`).remove();
                   }
                 }
               }
@@ -265,17 +279,15 @@ class FirebaseManager {
 }
 
 // ============================================
-// TIMEFRAME MANAGER - OPTIMIZED (REDUCED TIMEFRAMES)
+// TIMEFRAME MANAGER
 // ============================================
 class TimeframeManager {
   constructor() {
-    // ✅ REDUCED: Only keep essential timeframes
     this.timeframes = {
-      '1m': 60,    // Keep for 1-min trading
-      '5m': 300,   // Keep for 5-min charts
-      '15m': 900,  // Keep for 15-min charts
-      '1h': 3600,  // Keep for hourly analysis
-      // ❌ REMOVED: '1s', '4h', '1d' to reduce writes
+      '1m': 60,
+      '5m': 300,
+      '15m': 900,
+      '1h': 3600,
     };
 
     this.bars = {};
@@ -345,7 +357,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR - OPTIMIZED
+// ASSET SIMULATOR
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -435,7 +447,7 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ OPTIMIZED: Save current price (most critical)
+      // ✅ Save current price (most critical)
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -451,7 +463,7 @@ class AssetSimulator {
         currentPriceData
       );
 
-      // ✅ OPTIMIZED: Only save completed OHLC bars (async)
+      // ✅ Save completed OHLC bars (async)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -469,7 +481,6 @@ class AssetSimulator {
           isCompleted: true
         };
         
-        // Async write to queue
         this.firebase.setRealtimeValueAsync(
           `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
@@ -479,7 +490,6 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
-      // Log every 30 seconds (reduced from 10)
       const now = Date.now();
       if (now - this.lastLogTime > 30000) {
         const stats = this.firebase.getStats();
@@ -505,7 +515,7 @@ class AssetSimulator {
 }
 
 // ============================================
-// MULTI-ASSET MANAGER - OPTIMIZED
+// MULTI-ASSET MANAGER
 // ============================================
 class MultiAssetManager {
   constructor(firebaseManager) {
@@ -599,10 +609,10 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 OPTIMIZED SIMULATOR v4.0 STARTED');
+    logger.info('🚀 PRODUCTION SIMULATOR v5.0 STARTED');
+    logger.info('🚀 ✅ ADMIN SDK (BYPASSES RULES)');
+    logger.info('🚀 ✅ ULTRA SECURE FOR PRODUCTION');
     logger.info('🚀 ✅ AUTO CLEANUP ENABLED');
-    logger.info('🚀 ✅ REDUCED WRITES (4 timeframes only)');
-    logger.info('🚀 ✅ 7-DAY DATA RETENTION');
     logger.info('🚀 ================================================');
     logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${TimezoneUtil.formatDateTime()}`);
@@ -612,24 +622,22 @@ class MultiAssetManager {
     logger.info('🚀 ================================================');
     logger.info('');
 
-    // ✅ Price updates every 1 second (unchanged)
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, 1000);
 
-    // ✅ Settings refresh every 2 minutes (reduced from 1 minute)
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
     }, 120000);
 
-    // ✅ Stats logging every 60 seconds (reduced from 30)
     this.statsInterval = setInterval(() => {
       const stats = this.firebase.getStats();
       logger.info(`📊 Write Stats: Success: ${stats.success}, Failed: ${stats.failed}, Queue: ${stats.queueSize}, Rate: ${stats.successRate}%`);
     }, 60000);
 
-    logger.info('✅ All simulators running with optimizations!');
-    logger.info('💡 Old data auto-cleanup every hour');
+    logger.info('✅ All simulators running with Admin SDK!');
+    logger.info('🔒 Production rules active (write: false)');
+    logger.info('✅ Admin SDK bypasses all rules');
     logger.info('Press Ctrl+C to stop');
     logger.info('');
   }
@@ -676,7 +684,7 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌐 ================================================');
-  console.log('🌐 OPTIMIZED SIMULATOR v4.0');
+  console.log('🌐 PRODUCTION SIMULATOR v5.0 - ADMIN SDK');
   console.log('🌐 ================================================');
   console.log(`🌐 Process TZ: ${process.env.TZ}`);
   console.log(`🌐 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
