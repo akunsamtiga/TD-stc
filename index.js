@@ -1,10 +1,10 @@
 // ============================================
-// PRODUCTION SIMULATOR v5.0 - ADMIN SDK
+// MULTI-ASSET SIMULATOR v6.0 - AUTO-DISCOVERY
 // ============================================
-// ✅ Uses Admin SDK (bypasses rules)
-// ✅ Ultra secure for production
-// ✅ Auto-cleanup old data
-// ✅ Reduced OHLC timeframes
+// ✅ Auto-detect semua active assets
+// ✅ Setiap asset punya simulator independen
+// ✅ Auto-add asset baru tanpa restart
+// ✅ Auto-remove asset yang di-delete/deactive
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -63,19 +63,19 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE MANAGER - ADMIN SDK (PRODUCTION)
+// FIREBASE MANAGER - ADMIN SDK
 // ============================================
 class FirebaseManager {
   constructor() {
     this.db = null;
-    this.realtimeDbAdmin = null; // ✅ Admin SDK for Realtime DB
+    this.realtimeDbAdmin = null;
     this.writeQueue = [];
     this.isProcessingQueue = false;
     this.writeStats = { success: 0, failed: 0 };
     
     this.RETENTION_DAYS = 7;
     this.lastCleanupTime = 0;
-    this.CLEANUP_INTERVAL = 3600000;
+    this.CLEANUP_INTERVAL = 3600000; // 1 hour
   }
 
   async initialize() {
@@ -93,13 +93,11 @@ class FirebaseManager {
       if (!admin.apps.length) {
         admin.initializeApp({
           credential: admin.credential.cert(serviceAccount),
-          databaseURL: process.env.FIREBASE_REALTIME_DB_URL, // ✅ IMPORTANT
+          databaseURL: process.env.FIREBASE_REALTIME_DB_URL,
         });
       }
 
       this.db = admin.firestore();
-      
-      // ✅ PRODUCTION: Use Admin SDK for Realtime DB
       this.realtimeDbAdmin = admin.database();
       
       logger.info('✅ Firebase Admin SDK initialized successfully');
@@ -116,6 +114,9 @@ class FirebaseManager {
     }
   }
 
+  /**
+   * ✅ GET ALL ACTIVE ASSETS - Multi-asset support
+   */
   async getAssets() {
     try {
       const snapshot = await this.db.collection('assets')
@@ -125,8 +126,13 @@ class FirebaseManager {
       const assets = [];
       snapshot.forEach(doc => {
         const data = doc.data();
+        
+        // ✅ Support untuk semua tipe data source
         if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
-          assets.push({ id: doc.id, ...data });
+          assets.push({ 
+            id: doc.id, 
+            ...data 
+          });
         }
       });
 
@@ -137,7 +143,9 @@ class FirebaseManager {
     }
   }
 
-  // ✅ PRODUCTION: Get last price using Admin SDK
+  /**
+   * ✅ GET LAST PRICE - Per asset
+   */
   async getLastPrice(path) {
     try {
       if (!this.realtimeDbAdmin) {
@@ -163,7 +171,9 @@ class FirebaseManager {
     }
   }
 
-  // ✅ PRODUCTION: Write using Admin SDK (bypasses rules)
+  /**
+   * ✅ WRITE VALUE - Using Admin SDK
+   */
   async setRealtimeValue(path, data, retries = 2) {
     if (!this.realtimeDbAdmin) {
       logger.error('Realtime DB Admin not initialized');
@@ -173,7 +183,6 @@ class FirebaseManager {
 
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        // ✅ Admin SDK bypasses all rules!
         await this.realtimeDbAdmin.ref(path).set(data);
         this.writeStats.success++;
         return true;
@@ -190,10 +199,16 @@ class FirebaseManager {
     return false;
   }
 
+  /**
+   * ✅ ASYNC WRITE - For non-critical writes
+   */
   async setRealtimeValueAsync(path, data) {
     this.writeQueue.push({ path, data });
   }
 
+  /**
+   * ✅ WRITE QUEUE PROCESSOR
+   */
   async startQueueProcessor() {
     setInterval(async () => {
       if (this.isProcessingQueue || this.writeQueue.length === 0) return;
@@ -209,7 +224,9 @@ class FirebaseManager {
     }, 200);
   }
 
-  // ✅ AUTO CLEANUP OLD DATA
+  /**
+   * ✅ AUTO CLEANUP OLD DATA
+   */
   async startCleanupScheduler() {
     setInterval(async () => {
       const now = Date.now();
@@ -226,9 +243,7 @@ class FirebaseManager {
         const assets = await this.getAssets();
         
         for (const asset of assets) {
-          const path = asset.dataSource === 'realtime_db' 
-            ? asset.realtimeDbPath 
-            : `/mock/${asset.symbol.toLowerCase()}`;
+          const path = this.getAssetPath(asset);
           
           const timeframes = ['1m', '5m', '15m', '1h'];
           
@@ -245,7 +260,6 @@ class FirebaseManager {
                 if (oldKeys.length > 0) {
                   logger.info(`  🗑️ Deleting ${oldKeys.length} old ${tf} bars for ${asset.symbol}`);
                   
-                  // Delete using Admin SDK
                   for (const key of oldKeys) {
                     await this.realtimeDbAdmin.ref(`${path}/ohlc_${tf}/${key}`).remove();
                   }
@@ -264,6 +278,17 @@ class FirebaseManager {
         logger.error(`❌ Cleanup error: ${error.message}`);
       }
     }, this.CLEANUP_INTERVAL);
+  }
+
+  /**
+   * ✅ GET ASSET PATH - Determine path based on data source
+   */
+  getAssetPath(asset) {
+    if (asset.dataSource === 'realtime_db' && asset.realtimeDbPath) {
+      return asset.realtimeDbPath;
+    }
+    // Default path for mock assets
+    return `/mock/${asset.symbol.toLowerCase()}`;
   }
 
   getStats() {
@@ -357,7 +382,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR
+// ASSET SIMULATOR - Per Asset Instance
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -365,6 +390,7 @@ class AssetSimulator {
     this.firebase = firebaseManager;
     this.tfManager = new TimeframeManager();
 
+    // ✅ GET SETTINGS FROM ASSET
     const settings = asset.simulatorSettings || {};
     
     this.initialPrice = settings.initialPrice || 40.022;
@@ -380,18 +406,22 @@ class AssetSimulator {
     this.isResumed = false;
     this.lastPriceData = null;
 
-    if (asset.dataSource === 'realtime_db') {
-      this.realtimeDbPath = asset.realtimeDbPath;
-    } else {
-      this.realtimeDbPath = `/mock/${asset.symbol.toLowerCase()}`;
-    }
+    // ✅ DETERMINE PATH - Per asset
+    this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
+    logger.info('');
     logger.info(`✅ Simulator initialized for ${asset.symbol}`);
+    logger.info(`   Name: ${asset.name}`);
+    logger.info(`   Data Source: ${asset.dataSource}`);
+    logger.info(`   Path: ${this.realtimeDbPath}`);
     logger.info(`   Initial Price: ${this.initialPrice}`);
     logger.info(`   Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
-    logger.info(`   Path: ${this.realtimeDbPath}`);
+    logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
   }
 
+  /**
+   * ✅ LOAD LAST PRICE - Resume dari price terakhir
+   */
   async loadLastPrice() {
     try {
       logger.info(`🔍 [${this.asset.symbol}] Checking for last price...`);
@@ -419,6 +449,9 @@ class AssetSimulator {
     }
   }
 
+  /**
+   * ✅ GENERATE PRICE MOVEMENT
+   */
   generatePriceMovement() {
     const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
     
@@ -437,6 +470,9 @@ class AssetSimulator {
     return newPrice;
   }
 
+  /**
+   * ✅ UPDATE PRICE - Main update logic
+   */
   async updatePrice() {
     try {
       const timestamp = TimezoneUtil.getCurrentTimestamp();
@@ -493,7 +529,12 @@ class AssetSimulator {
       const now = Date.now();
       if (now - this.lastLogTime > 30000) {
         const stats = this.firebase.getStats();
-        logger.info(`[${this.asset.symbol}] ${this.isResumed ? '🔄 RESUMED' : '🆕 FRESH'} | Iter ${this.iteration}: ${newPrice.toFixed(6)} (${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%) | Writes: ${stats.successRate}%`);
+        logger.info(
+          `[${this.asset.symbol}] ${this.isResumed ? '🔄 RESUMED' : '🆕 FRESH'} | ` +
+          `Iter ${this.iteration}: ${newPrice.toFixed(6)} ` +
+          `(${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%) | ` +
+          `Writes: ${stats.successRate}%`
+        );
         this.lastLogTime = now;
       }
 
@@ -502,6 +543,9 @@ class AssetSimulator {
     }
   }
 
+  /**
+   * ✅ UPDATE SETTINGS - When asset is updated
+   */
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
@@ -511,6 +555,22 @@ class AssetSimulator {
     this.maxPrice = settings.maxPrice || this.maxPrice;
 
     this.asset = newAsset;
+    
+    logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
+  }
+
+  /**
+   * ✅ GET INFO
+   */
+  getInfo() {
+    return {
+      symbol: this.asset.symbol,
+      name: this.asset.name,
+      currentPrice: this.currentPrice,
+      iteration: this.iteration,
+      isResumed: this.isResumed,
+      path: this.realtimeDbPath
+    };
   }
 }
 
@@ -520,13 +580,16 @@ class AssetSimulator {
 class MultiAssetManager {
   constructor(firebaseManager) {
     this.firebase = firebaseManager;
-    this.simulators = new Map();
+    this.simulators = new Map(); // assetId -> AssetSimulator
     this.updateInterval = null;
     this.settingsRefreshInterval = null;
     this.statsInterval = null;
     this.isRunning = false;
   }
 
+  /**
+   * ✅ INITIALIZE - Load all active assets
+   */
   async initialize() {
     logger.info('🎯 Initializing Multi-Asset Manager...');
     
@@ -548,27 +611,42 @@ class MultiAssetManager {
     logger.info(`✅ ${this.simulators.size} simulators initialized`);
   }
 
+  /**
+   * ✅ REFRESH ASSETS - Auto-detect new/removed assets
+   */
   async refreshAssets() {
     try {
       const assets = await this.firebase.getAssets();
       const currentIds = new Set(this.simulators.keys());
       const newIds = new Set(assets.map(a => a.id));
 
+      // ✅ REMOVE deleted/inactive assets
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
-          logger.info(`🗑️ Removing simulator for ${simulator.asset.symbol}`);
+          logger.info('');
+          logger.info(`🗑️ ================================================`);
+          logger.info(`🗑️ REMOVING SIMULATOR: ${simulator.asset.symbol}`);
+          logger.info(`🗑️ ================================================`);
           this.simulators.delete(id);
         }
       }
 
+      // ✅ ADD new assets
       for (const asset of assets) {
         if (!currentIds.has(asset.id)) {
-          logger.info(`➕ Adding simulator for ${asset.symbol}`);
+          logger.info('');
+          logger.info(`➕ ================================================`);
+          logger.info(`➕ NEW ASSET DETECTED: ${asset.symbol}`);
+          logger.info(`➕ ================================================`);
+          
           const simulator = new AssetSimulator(asset, this.firebase);
           await simulator.loadLastPrice();
           this.simulators.set(asset.id, simulator);
+          
+          logger.info(`➕ Simulator started for ${asset.symbol}`);
         } else {
+          // ✅ UPDATE existing asset settings
           const simulator = this.simulators.get(asset.id);
           simulator.updateSettings(asset);
         }
@@ -580,6 +658,9 @@ class MultiAssetManager {
     }
   }
 
+  /**
+   * ✅ UPDATE ALL PRICES - Parallel updates
+   */
   async updateAllPrices() {
     if (this.simulators.size === 0) return;
 
@@ -591,6 +672,9 @@ class MultiAssetManager {
     await Promise.allSettled(promises);
   }
 
+  /**
+   * ✅ START - Main entry point
+   */
   async start() {
     if (this.isRunning) {
       logger.warn('⚠️ Manager already running');
@@ -609,39 +693,71 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 PRODUCTION SIMULATOR v5.0 STARTED');
-    logger.info('🚀 ✅ ADMIN SDK (BYPASSES RULES)');
-    logger.info('🚀 ✅ ULTRA SECURE FOR PRODUCTION');
-    logger.info('🚀 ✅ AUTO CLEANUP ENABLED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v6.0 STARTED');
     logger.info('🚀 ================================================');
-    logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
+    logger.info('🚀 ✅ ADMIN SDK (BYPASSES RULES)');
+    logger.info('🚀 ✅ AUTO-DISCOVERY NEW ASSETS');
+    logger.info('🚀 ✅ INDEPENDENT SIMULATORS');
+    logger.info('🚀 ================================================');
+    logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`📊 Active Assets: ${this.simulators.size}`);
     logger.info('⏱️ Update Interval: 1 second');
+    logger.info('🔄 Asset Refresh: Every 2 minutes');
     logger.info('🗑️ Cleanup: Every 1 hour (keeps 7 days)');
     logger.info('🚀 ================================================');
     logger.info('');
 
+    // ✅ List all active simulators
+    logger.info('📋 ACTIVE SIMULATORS:');
+    logger.info('================================================');
+    for (const [id, simulator] of this.simulators.entries()) {
+      const info = simulator.getInfo();
+      logger.info(`   • ${info.symbol} - ${info.name}`);
+      logger.info(`     Path: ${info.path}`);
+      logger.info(`     Price: ${info.currentPrice.toFixed(6)}`);
+      logger.info(`     Status: ${info.isResumed ? '🔄 RESUMED' : '🆕 FRESH START'}`);
+    }
+    logger.info('================================================');
+    logger.info('');
+
+    // ✅ START PRICE UPDATES (1 second interval)
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, 1000);
 
+    // ✅ START ASSET REFRESH (2 minutes interval)
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
     }, 120000);
 
+    // ✅ START STATS LOGGING (1 minute interval)
     this.statsInterval = setInterval(() => {
       const stats = this.firebase.getStats();
-      logger.info(`📊 Write Stats: Success: ${stats.success}, Failed: ${stats.failed}, Queue: ${stats.queueSize}, Rate: ${stats.successRate}%`);
+      logger.info('');
+      logger.info(`📊 ================================================`);
+      logger.info(`📊 STATISTICS`);
+      logger.info(`📊 ================================================`);
+      logger.info(`   Active Simulators: ${this.simulators.size}`);
+      logger.info(`   Write Success: ${stats.success}`);
+      logger.info(`   Write Failed: ${stats.failed}`);
+      logger.info(`   Success Rate: ${stats.successRate}%`);
+      logger.info(`   Write Queue: ${stats.queueSize}`);
+      logger.info(`📊 ================================================`);
+      logger.info('');
     }, 60000);
 
     logger.info('✅ All simulators running with Admin SDK!');
-    logger.info('🔒 Production rules active (write: false)');
+    logger.info('🔐 Production rules active (write: false)');
     logger.info('✅ Admin SDK bypasses all rules');
+    logger.info('💡 Add new asset via API - auto-detected in 2 minutes!');
     logger.info('Press Ctrl+C to stop');
     logger.info('');
   }
 
+  /**
+   * ✅ STOP - Graceful shutdown
+   */
   async stop() {
     if (!this.isRunning) return;
 
@@ -667,6 +783,7 @@ class MultiAssetManager {
 
     logger.info('📊 Final Statistics:');
     const stats = this.firebase.getStats();
+    logger.info(`   Active Simulators: ${this.simulators.size}`);
     logger.info(`   Write Stats: Success: ${stats.success}, Failed: ${stats.failed}, Success Rate: ${stats.successRate}%`);
     
     logger.info('');
@@ -683,12 +800,12 @@ class MultiAssetManager {
 // ============================================
 async function main() {
   console.log('');
-  console.log('🌐 ================================================');
-  console.log('🌐 PRODUCTION SIMULATOR v5.0 - ADMIN SDK');
-  console.log('🌐 ================================================');
-  console.log(`🌐 Process TZ: ${process.env.TZ}`);
-  console.log(`🌐 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
-  console.log('🌐 ================================================');
+  console.log('🌍 ================================================');
+  console.log('🌍 MULTI-ASSET SIMULATOR v6.0');
+  console.log('🌍 ================================================');
+  console.log(`🌍 Process TZ: ${process.env.TZ}`);
+  console.log(`🌍 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
+  console.log('🌍 ================================================');
   console.log('');
 
   try {
