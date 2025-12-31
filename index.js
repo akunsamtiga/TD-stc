@@ -1,10 +1,10 @@
 // ============================================
-// MULTI-ASSET SIMULATOR v6.0 - AUTO-DISCOVERY
+// MULTI-ASSET SIMULATOR v7.0 - BILLING-OPTIMIZED
 // ============================================
-// ✅ Auto-detect semua active assets
-// ✅ Setiap asset punya simulator independen
-// ✅ Auto-add asset baru tanpa restart
-// ✅ Auto-remove asset yang di-delete/deactive
+// ✅ Optimized asset refresh (10min instead of 2min)
+// ✅ Reduced Firestore reads by 80%
+// ✅ Real-time price generation unchanged (1s interval)
+// ✅ Frontend tetap dapat real-time updates
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -63,7 +63,7 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE MANAGER - ADMIN SDK
+// FIREBASE MANAGER
 // ============================================
 class FirebaseManager {
   constructor() {
@@ -75,7 +75,11 @@ class FirebaseManager {
     
     this.RETENTION_DAYS = 7;
     this.lastCleanupTime = 0;
-    this.CLEANUP_INTERVAL = 3600000; // 1 hour
+    this.CLEANUP_INTERVAL = 3600000;
+    
+    // 🎯 BILLING OPTIMIZATION: Track Firestore reads
+    this.firestoreReadCount = 0;
+    this.lastReadReset = Date.now();
   }
 
   async initialize() {
@@ -100,9 +104,10 @@ class FirebaseManager {
       this.db = admin.firestore();
       this.realtimeDbAdmin = admin.database();
       
-      logger.info('✅ Firebase Admin SDK initialized successfully');
+      logger.info('✅ Firebase Admin SDK initialized (BILLING-OPTIMIZED)');
       logger.info('✅ Firestore ready');
-      logger.info('✅ Realtime DB Admin SDK ready (bypasses all rules)');
+      logger.info('✅ Realtime DB Admin SDK ready');
+      logger.info('💰 Billing optimizations enabled');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -115,10 +120,12 @@ class FirebaseManager {
   }
 
   /**
-   * ✅ GET ALL ACTIVE ASSETS - Multi-asset support
+   * 🎯 GET ALL ACTIVE ASSETS - With read tracking
    */
   async getAssets() {
     try {
+      this.firestoreReadCount++; // Track read
+      
       const snapshot = await this.db.collection('assets')
         .where('isActive', '==', true)
         .get();
@@ -127,7 +134,6 @@ class FirebaseManager {
       snapshot.forEach(doc => {
         const data = doc.data();
         
-        // ✅ Support untuk semua tipe data source
         if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
           assets.push({ 
             id: doc.id, 
@@ -136,6 +142,8 @@ class FirebaseManager {
         }
       });
 
+      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: Fetched ${assets.length} assets`);
+
       return assets;
     } catch (error) {
       logger.error(`Error fetching assets: ${error.message}`);
@@ -143,9 +151,6 @@ class FirebaseManager {
     }
   }
 
-  /**
-   * ✅ GET LAST PRICE - Per asset
-   */
   async getLastPrice(path) {
     try {
       if (!this.realtimeDbAdmin) {
@@ -171,9 +176,6 @@ class FirebaseManager {
     }
   }
 
-  /**
-   * ✅ WRITE VALUE - Using Admin SDK
-   */
   async setRealtimeValue(path, data, retries = 2) {
     if (!this.realtimeDbAdmin) {
       logger.error('Realtime DB Admin not initialized');
@@ -199,16 +201,10 @@ class FirebaseManager {
     return false;
   }
 
-  /**
-   * ✅ ASYNC WRITE - For non-critical writes
-   */
   async setRealtimeValueAsync(path, data) {
     this.writeQueue.push({ path, data });
   }
 
-  /**
-   * ✅ WRITE QUEUE PROCESSOR
-   */
   async startQueueProcessor() {
     setInterval(async () => {
       if (this.isProcessingQueue || this.writeQueue.length === 0) return;
@@ -224,9 +220,6 @@ class FirebaseManager {
     }, 200);
   }
 
-  /**
-   * ✅ AUTO CLEANUP OLD DATA
-   */
   async startCleanupScheduler() {
     setInterval(async () => {
       const now = Date.now();
@@ -280,25 +273,30 @@ class FirebaseManager {
     }, this.CLEANUP_INTERVAL);
   }
 
-  /**
-   * ✅ GET ASSET PATH - Determine path based on data source
-   */
   getAssetPath(asset) {
     if (asset.dataSource === 'realtime_db' && asset.realtimeDbPath) {
       return asset.realtimeDbPath;
     }
-    // Default path for mock assets
     return `/mock/${asset.symbol.toLowerCase()}`;
   }
 
   getStats() {
+    const now = Date.now();
+    const timeSinceReset = now - this.lastReadReset;
+    const hoursSinceReset = timeSinceReset / 3600000;
+    
     return {
       success: this.writeStats.success,
       failed: this.writeStats.failed,
       queueSize: this.writeQueue.length,
       successRate: this.writeStats.success > 0 
         ? Math.round((this.writeStats.success / (this.writeStats.success + this.writeStats.failed)) * 100)
-        : 0
+        : 0,
+      billing: {
+        firestoreReads: this.firestoreReadCount,
+        readsPer24h: hoursSinceReset > 0 ? Math.round(this.firestoreReadCount / hoursSinceReset * 24) : 0,
+        timeSinceReset: `${Math.floor(hoursSinceReset)}h ${Math.floor((hoursSinceReset % 1) * 60)}m`
+      }
     };
   }
 }
@@ -382,7 +380,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR - Per Asset Instance
+// ASSET SIMULATOR
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -390,7 +388,6 @@ class AssetSimulator {
     this.firebase = firebaseManager;
     this.tfManager = new TimeframeManager();
 
-    // ✅ GET SETTINGS FROM ASSET
     const settings = asset.simulatorSettings || {};
     
     this.initialPrice = settings.initialPrice || 40.022;
@@ -406,7 +403,6 @@ class AssetSimulator {
     this.isResumed = false;
     this.lastPriceData = null;
 
-    // ✅ DETERMINE PATH - Per asset
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
     logger.info('');
@@ -419,9 +415,6 @@ class AssetSimulator {
     logger.info(`   Price Range: ${this.minPrice} - ${this.maxPrice}`);
   }
 
-  /**
-   * ✅ LOAD LAST PRICE - Resume dari price terakhir
-   */
   async loadLastPrice() {
     try {
       logger.info(`🔍 [${this.asset.symbol}] Checking for last price...`);
@@ -449,9 +442,6 @@ class AssetSimulator {
     }
   }
 
-  /**
-   * ✅ GENERATE PRICE MOVEMENT
-   */
   generatePriceMovement() {
     const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
     
@@ -470,9 +460,8 @@ class AssetSimulator {
     return newPrice;
   }
 
-  /**
-   * ✅ UPDATE PRICE - Main update logic
-   */
+  // 🎯 REAL-TIME PRICE UPDATE - Unchanged (1 second interval)
+  // Frontend akan receive updates via Realtime DB subscription
   async updatePrice() {
     try {
       const timestamp = TimezoneUtil.getCurrentTimestamp();
@@ -483,7 +472,8 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ Save current price (most critical)
+      // ✅ Current price write (real-time, 1 second interval)
+      // Frontend subscribes to this for live updates
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -493,13 +483,12 @@ class AssetSimulator {
         change: parseFloat(((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
       };
       
-      // ✅ Write current price (synchronous - most important)
       await this.firebase.setRealtimeValue(
         `${this.realtimeDbPath}/current_price`,
         currentPriceData
       );
 
-      // ✅ Save completed OHLC bars (async)
+      // ✅ OHLC bars (async writes)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -543,9 +532,6 @@ class AssetSimulator {
     }
   }
 
-  /**
-   * ✅ UPDATE SETTINGS - When asset is updated
-   */
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
@@ -559,9 +545,6 @@ class AssetSimulator {
     logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
   }
 
-  /**
-   * ✅ GET INFO
-   */
   getInfo() {
     return {
       symbol: this.asset.symbol,
@@ -575,23 +558,20 @@ class AssetSimulator {
 }
 
 // ============================================
-// MULTI-ASSET MANAGER
+// MULTI-ASSET MANAGER - BILLING OPTIMIZED
 // ============================================
 class MultiAssetManager {
   constructor(firebaseManager) {
     this.firebase = firebaseManager;
-    this.simulators = new Map(); // assetId -> AssetSimulator
+    this.simulators = new Map();
     this.updateInterval = null;
     this.settingsRefreshInterval = null;
     this.statsInterval = null;
     this.isRunning = false;
   }
 
-  /**
-   * ✅ INITIALIZE - Load all active assets
-   */
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager...');
+    logger.info('🎯 Initializing Multi-Asset Manager (BILLING-OPTIMIZED)...');
     
     const assets = await this.firebase.getAssets();
     
@@ -612,7 +592,11 @@ class MultiAssetManager {
   }
 
   /**
-   * ✅ REFRESH ASSETS - Auto-detect new/removed assets
+   * 🎯 BILLING OPTIMIZATION: Reduced refresh frequency
+   * 
+   * OLD: Every 2 minutes (720 reads/day per asset)
+   * NEW: Every 10 minutes (144 reads/day per asset)
+   * SAVINGS: 80% reduction in Firestore reads!
    */
   async refreshAssets() {
     try {
@@ -620,7 +604,6 @@ class MultiAssetManager {
       const currentIds = new Set(this.simulators.keys());
       const newIds = new Set(assets.map(a => a.id));
 
-      // ✅ REMOVE deleted/inactive assets
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
@@ -632,7 +615,6 @@ class MultiAssetManager {
         }
       }
 
-      // ✅ ADD new assets
       for (const asset of assets) {
         if (!currentIds.has(asset.id)) {
           logger.info('');
@@ -646,7 +628,6 @@ class MultiAssetManager {
           
           logger.info(`➕ Simulator started for ${asset.symbol}`);
         } else {
-          // ✅ UPDATE existing asset settings
           const simulator = this.simulators.get(asset.id);
           simulator.updateSettings(asset);
         }
@@ -658,9 +639,6 @@ class MultiAssetManager {
     }
   }
 
-  /**
-   * ✅ UPDATE ALL PRICES - Parallel updates
-   */
   async updateAllPrices() {
     if (this.simulators.size === 0) return;
 
@@ -672,9 +650,6 @@ class MultiAssetManager {
     await Promise.allSettled(promises);
   }
 
-  /**
-   * ✅ START - Main entry point
-   */
   async start() {
     if (this.isRunning) {
       logger.warn('⚠️ Manager already running');
@@ -693,22 +668,22 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v6.0 STARTED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v7.0 - BILLING-OPTIMIZED');
     logger.info('🚀 ================================================');
     logger.info('🚀 ✅ ADMIN SDK (BYPASSES RULES)');
-    logger.info('🚀 ✅ AUTO-DISCOVERY NEW ASSETS');
-    logger.info('🚀 ✅ INDEPENDENT SIMULATORS');
+    logger.info('🚀 ✅ REAL-TIME PRICE UPDATES (1s interval)');
+    logger.info('🚀 ✅ OPTIMIZED ASSET REFRESH (10min interval)');
     logger.info('🚀 ================================================');
-    logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
+    logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`📊 Active Assets: ${this.simulators.size}`);
-    logger.info('⏱️ Update Interval: 1 second');
-    logger.info('🔄 Asset Refresh: Every 2 minutes');
+    logger.info('⏱️ Price Update: 1 second (real-time for frontend)');
+    logger.info('🔄 Asset Refresh: Every 10 minutes (was 2 min)');
+    logger.info('💰 Billing Savings: 80% fewer Firestore reads');
     logger.info('🗑️ Cleanup: Every 1 hour (keeps 7 days)');
     logger.info('🚀 ================================================');
     logger.info('');
 
-    // ✅ List all active simulators
     logger.info('📋 ACTIVE SIMULATORS:');
     logger.info('================================================');
     for (const [id, simulator] of this.simulators.entries()) {
@@ -721,17 +696,17 @@ class MultiAssetManager {
     logger.info('================================================');
     logger.info('');
 
-    // ✅ START PRICE UPDATES (1 second interval)
+    // ✅ PRICE UPDATES - 1 second (unchanged for real-time frontend)
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, 1000);
 
-    // ✅ START ASSET REFRESH (2 minutes interval)
+    // 🎯 ASSET REFRESH - 10 minutes (optimized from 2 min)
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
-    }, 120000);
+    }, 600000); // 10 minutes = 600,000ms
 
-    // ✅ START STATS LOGGING (1 minute interval)
+    // ✅ STATS LOGGING
     this.statsInterval = setInterval(() => {
       const stats = this.firebase.getStats();
       logger.info('');
@@ -743,21 +718,25 @@ class MultiAssetManager {
       logger.info(`   Write Failed: ${stats.failed}`);
       logger.info(`   Success Rate: ${stats.successRate}%`);
       logger.info(`   Write Queue: ${stats.queueSize}`);
+      logger.info(`   💰 Firestore Reads: ${stats.billing.firestoreReads}`);
+      logger.info(`   💰 Est. Reads/24h: ${stats.billing.readsPer24h}`);
+      logger.info(`   💰 Time Since Reset: ${stats.billing.timeSinceReset}`);
       logger.info(`📊 ================================================`);
       logger.info('');
     }, 60000);
 
-    logger.info('✅ All simulators running with Admin SDK!');
-    logger.info('🔐 Production rules active (write: false)');
-    logger.info('✅ Admin SDK bypasses all rules');
-    logger.info('💡 Add new asset via API - auto-detected in 2 minutes!');
+    logger.info('✅ All simulators running!');
+    logger.info('💰 BILLING OPTIMIZATIONS:');
+    logger.info('   • Asset refresh: Every 10 min (was 2 min)');
+    logger.info('   • 80% reduction in Firestore reads');
+    logger.info('   • Real-time prices: Still 1s updates for frontend');
+    logger.info('   • Frontend gets live data via Realtime DB subscription');
+    logger.info('');
+    logger.info('💡 Add new asset via API - auto-detected in 10 minutes!');
     logger.info('Press Ctrl+C to stop');
     logger.info('');
   }
 
-  /**
-   * ✅ STOP - Graceful shutdown
-   */
   async stop() {
     if (!this.isRunning) return;
 
@@ -784,7 +763,8 @@ class MultiAssetManager {
     logger.info('📊 Final Statistics:');
     const stats = this.firebase.getStats();
     logger.info(`   Active Simulators: ${this.simulators.size}`);
-    logger.info(`   Write Stats: Success: ${stats.success}, Failed: ${stats.failed}, Success Rate: ${stats.successRate}%`);
+    logger.info(`   Writes: Success: ${stats.success}, Failed: ${stats.failed}, Rate: ${stats.successRate}%`);
+    logger.info(`   Firestore Reads: ${stats.billing.firestoreReads}`);
     
     logger.info('');
     logger.info('✅ Multi-Asset Manager stopped gracefully');
@@ -800,12 +780,12 @@ class MultiAssetManager {
 // ============================================
 async function main() {
   console.log('');
-  console.log('🌍 ================================================');
-  console.log('🌍 MULTI-ASSET SIMULATOR v6.0');
-  console.log('🌍 ================================================');
-  console.log(`🌍 Process TZ: ${process.env.TZ}`);
-  console.log(`🌍 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
-  console.log('🌍 ================================================');
+  console.log('🌐 ================================================');
+  console.log('🌐 MULTI-ASSET SIMULATOR v7.0 - BILLING-OPTIMIZED');
+  console.log('🌐 ================================================');
+  console.log(`🌐 Process TZ: ${process.env.TZ}`);
+  console.log(`🌐 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
+  console.log('🌐 ================================================');
   console.log('');
 
   try {
