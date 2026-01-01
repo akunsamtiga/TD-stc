@@ -64,11 +64,12 @@ class TimezoneUtil {
 }
 
 // ============================================
-// 🔥 WATCHDOG - Deteksi & Recovery Stuck
+// 🔥 FIXED WATCHDOG - Deteksi & Recovery Stuck
 // ============================================
 class Watchdog {
   constructor(name, timeoutSeconds = 60) {
     this.name = name;
+    this.timeoutSeconds = timeoutSeconds; // ✅ FIXED: Save as property
     this.timeoutMs = timeoutSeconds * 1000;
     this.lastActivity = Date.now();
     this.isActive = false;
@@ -115,7 +116,8 @@ class Watchdog {
       }
     }, 30000); // Check every 30 seconds
 
-    logger.info(`🐕 Watchdog started for ${this.name} (timeout: ${timeoutSeconds}s)`);
+    // ✅ FIXED: Use this.timeoutSeconds
+    logger.info(`🐕 Watchdog started for ${this.name} (timeout: ${this.timeoutSeconds}s)`);
   }
 
   heartbeat() {
@@ -429,7 +431,7 @@ class FirebaseManager {
 }
 
 // ============================================
-// TIMEFRAME MANAGER (Unchanged)
+// TIMEFRAME MANAGER
 // ============================================
 class TimeframeManager {
   constructor() {
@@ -507,7 +509,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR (Enhanced with activity tracking)
+// ASSET SIMULATOR
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -697,7 +699,7 @@ class AssetSimulator {
       path: this.realtimeDbPath,
       updateCount: this.updateCount,
       lastUpdate: Math.floor(timeSinceUpdate / 1000),
-      isHealthy: timeSinceUpdate < 5000 // Healthy if updated in last 5 seconds
+      isHealthy: timeSinceUpdate < 5000
     };
   }
 }
@@ -1092,10 +1094,10 @@ if (global.gc) {
     global.gc();
     const after = process.memoryUsage().heapUsed;
     const freed = before - after;
-    if (freed > 1024 * 1024) { // More than 1MB freed
+    if (freed > 1024 * 1024) {
       logger.debug(`🧹 GC freed ${Math.round(freed / 1024 / 1024)}MB`);
     }
-  }, 300000); // Every 5 minutes
+  }, 300000);
 }
 
 main();
