@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: 'multi-asset-simulator',
     script: './index.js',
-        node_args: '--expose-gc', 
+    
     instances: 1,
     exec_mode: 'fork',
     
