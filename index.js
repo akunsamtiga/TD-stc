@@ -1,10 +1,11 @@
 // ============================================
-// MULTI-ASSET SIMULATOR v7.0 - BILLING-OPTIMIZED
+// MULTI-ASSET SIMULATOR v8.0 - WATCHDOG EDITION
 // ============================================
-// ✅ Optimized asset refresh (10min instead of 2min)
-// ✅ Reduced Firestore reads by 80%
-// ✅ Real-time price generation unchanged (1s interval)
-// ✅ Frontend tetap dapat real-time updates
+// 🔥 FIXED: Watchdog prevents stuck/freeze
+// 🩺 Health check setiap 30 detik
+// 💾 Memory management & auto GC
+// ⏱️ Timeout protection untuk semua ops
+// 📊 Better activity tracking
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -63,7 +64,89 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE MANAGER
+// 🔥 WATCHDOG - Deteksi & Recovery Stuck
+// ============================================
+class Watchdog {
+  constructor(name, timeoutSeconds = 60) {
+    this.name = name;
+    this.timeoutMs = timeoutSeconds * 1000;
+    this.lastActivity = Date.now();
+    this.isActive = false;
+    this.checkInterval = null;
+    this.stuckCount = 0;
+    this.MAX_STUCK_COUNT = 3;
+  }
+
+  start(onStuck) {
+    this.isActive = true;
+    this.lastActivity = Date.now();
+    this.onStuck = onStuck;
+
+    this.checkInterval = setInterval(() => {
+      const now = Date.now();
+      const timeSinceActivity = now - this.lastActivity;
+      
+      if (timeSinceActivity > this.timeoutMs) {
+        this.stuckCount++;
+        
+        logger.error('');
+        logger.error('⚠️ ================================================');
+        logger.error(`⚠️ WATCHDOG ALERT: ${this.name} STUCK!`);
+        logger.error('⚠️ ================================================');
+        logger.error(`   Time since last activity: ${Math.floor(timeSinceActivity / 1000)}s`);
+        logger.error(`   Stuck count: ${this.stuckCount}/${this.MAX_STUCK_COUNT}`);
+        logger.error(`   Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+        logger.error('⚠️ ================================================');
+        logger.error('');
+
+        if (this.stuckCount >= this.MAX_STUCK_COUNT) {
+          logger.error('🔥 Max stuck count reached - triggering recovery...');
+          if (this.onStuck) {
+            this.onStuck();
+          }
+        } else {
+          logger.warn(`⚠️ Will retry ${this.MAX_STUCK_COUNT - this.stuckCount} more time(s)`);
+        }
+      } else {
+        if (this.stuckCount > 0) {
+          logger.info('✅ Watchdog: Activity resumed, resetting stuck count');
+          this.stuckCount = 0;
+        }
+      }
+    }, 30000); // Check every 30 seconds
+
+    logger.info(`🐕 Watchdog started for ${this.name} (timeout: ${timeoutSeconds}s)`);
+  }
+
+  heartbeat() {
+    this.lastActivity = Date.now();
+    if (this.stuckCount > 0) {
+      this.stuckCount = 0; // Reset on activity
+    }
+  }
+
+  stop() {
+    this.isActive = false;
+    if (this.checkInterval) {
+      clearInterval(this.checkInterval);
+      this.checkInterval = null;
+    }
+    logger.info(`🐕 Watchdog stopped for ${this.name}`);
+  }
+
+  getStatus() {
+    const timeSinceActivity = Date.now() - this.lastActivity;
+    return {
+      active: this.isActive,
+      lastActivity: Math.floor(timeSinceActivity / 1000),
+      stuckCount: this.stuckCount,
+      healthy: timeSinceActivity < this.timeoutMs
+    };
+  }
+}
+
+// ============================================
+// FIREBASE MANAGER (Enhanced)
 // ============================================
 class FirebaseManager {
   constructor() {
@@ -77,9 +160,13 @@ class FirebaseManager {
     this.lastCleanupTime = 0;
     this.CLEANUP_INTERVAL = 3600000;
     
-    // 🎯 BILLING OPTIMIZATION: Track Firestore reads
     this.firestoreReadCount = 0;
     this.lastReadReset = Date.now();
+    
+    // 🔥 Connection health tracking
+    this.lastSuccessfulWrite = Date.now();
+    this.consecutiveFailures = 0;
+    this.MAX_CONSECUTIVE_FAILURES = 10;
   }
 
   async initialize() {
@@ -104,10 +191,16 @@ class FirebaseManager {
       this.db = admin.firestore();
       this.realtimeDbAdmin = admin.database();
       
-      logger.info('✅ Firebase Admin SDK initialized (BILLING-OPTIMIZED)');
+      // 🔥 Test connection
+      await Promise.race([
+        this.realtimeDbAdmin.ref('/.info/connected').once('value'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), 5000))
+      ]);
+      
+      logger.info('✅ Firebase Admin SDK initialized (WATCHDOG EDITION)');
       logger.info('✅ Firestore ready');
       logger.info('✅ Realtime DB Admin SDK ready');
-      logger.info('💰 Billing optimizations enabled');
+      logger.info('🐕 Watchdog & Auto-recovery enabled');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -119,31 +212,25 @@ class FirebaseManager {
     }
   }
 
-  /**
-   * 🎯 GET ALL ACTIVE ASSETS - With read tracking
-   */
   async getAssets() {
     try {
-      this.firestoreReadCount++; // Track read
+      this.firestoreReadCount++;
       
-      const snapshot = await this.db.collection('assets')
-        .where('isActive', '==', true)
-        .get();
+      // 🔥 Add timeout
+      const snapshot = await Promise.race([
+        this.db.collection('assets').where('isActive', '==', true).get(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 10000))
+      ]);
 
       const assets = [];
       snapshot.forEach(doc => {
         const data = doc.data();
-        
         if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
-          assets.push({ 
-            id: doc.id, 
-            ...data 
-          });
+          assets.push({ id: doc.id, ...data });
         }
       });
 
       logger.debug(`📊 Firestore read #${this.firestoreReadCount}: Fetched ${assets.length} assets`);
-
       return assets;
     } catch (error) {
       logger.error(`Error fetching assets: ${error.message}`);
@@ -158,7 +245,12 @@ class FirebaseManager {
         return null;
       }
 
-      const snapshot = await this.realtimeDbAdmin.ref(`${path}/current_price`).once('value');
+      // 🔥 Add timeout
+      const snapshot = await Promise.race([
+        this.realtimeDbAdmin.ref(`${path}/current_price`).once('value'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Read timeout')), 5000))
+      ]);
+
       const data = snapshot.val();
       
       if (data && data.price) {
@@ -180,19 +272,40 @@ class FirebaseManager {
     if (!this.realtimeDbAdmin) {
       logger.error('Realtime DB Admin not initialized');
       this.writeStats.failed++;
+      this.consecutiveFailures++;
       return false;
     }
 
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        await this.realtimeDbAdmin.ref(path).set(data);
+        // 🔥 Add timeout
+        await Promise.race([
+          this.realtimeDbAdmin.ref(path).set(data),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Write timeout')), 5000))
+        ]);
+
         this.writeStats.success++;
+        this.lastSuccessfulWrite = Date.now();
+        this.consecutiveFailures = 0; // Reset on success
         return true;
       } catch (error) {
         if (attempt < retries - 1) {
           await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
         } else {
           this.writeStats.failed++;
+          this.consecutiveFailures++;
+          
+          if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
+            logger.error('');
+            logger.error('🔥 ================================================');
+            logger.error('🔥 FIREBASE CONNECTION PROBLEM!');
+            logger.error('🔥 ================================================');
+            logger.error(`   Consecutive failures: ${this.consecutiveFailures}`);
+            logger.error(`   Time since last success: ${Math.floor((Date.now() - this.lastSuccessfulWrite) / 1000)}s`);
+            logger.error('🔥 ================================================');
+            logger.error('');
+          }
+          
           logger.error(`Write failed at ${path}: ${error.message}`);
           return false;
         }
@@ -202,7 +315,12 @@ class FirebaseManager {
   }
 
   async setRealtimeValueAsync(path, data) {
-    this.writeQueue.push({ path, data });
+    this.writeQueue.push({ path, data, timestamp: Date.now() });
+    
+    // 🔥 Prevent queue overflow
+    if (this.writeQueue.length > 100) {
+      logger.warn(`⚠️ Write queue large: ${this.writeQueue.length} items`);
+    }
   }
 
   async startQueueProcessor() {
@@ -211,6 +329,13 @@ class FirebaseManager {
       
       this.isProcessingQueue = true;
       const batch = this.writeQueue.splice(0, 10);
+      
+      // 🔥 Detect stale items
+      const now = Date.now();
+      const staleItems = batch.filter(item => (now - item.timestamp) > 30000);
+      if (staleItems.length > 0) {
+        logger.warn(`⚠️ Processing ${staleItems.length} stale queue items`);
+      }
       
       await Promise.allSettled(
         batch.map(({ path, data }) => this.setRealtimeValue(path, data, 1))
@@ -237,7 +362,6 @@ class FirebaseManager {
         
         for (const asset of assets) {
           const path = this.getAssetPath(asset);
-          
           const timeframes = ['1m', '5m', '15m', '1h'];
           
           for (const tf of timeframes) {
@@ -284,6 +408,7 @@ class FirebaseManager {
     const now = Date.now();
     const timeSinceReset = now - this.lastReadReset;
     const hoursSinceReset = timeSinceReset / 3600000;
+    const timeSinceLastWrite = now - this.lastSuccessfulWrite;
     
     return {
       success: this.writeStats.success,
@@ -292,6 +417,8 @@ class FirebaseManager {
       successRate: this.writeStats.success > 0 
         ? Math.round((this.writeStats.success / (this.writeStats.success + this.writeStats.failed)) * 100)
         : 0,
+      consecutiveFailures: this.consecutiveFailures,
+      lastSuccessfulWrite: Math.floor(timeSinceLastWrite / 1000),
       billing: {
         firestoreReads: this.firestoreReadCount,
         readsPer24h: hoursSinceReset > 0 ? Math.round(this.firestoreReadCount / hoursSinceReset * 24) : 0,
@@ -302,7 +429,7 @@ class FirebaseManager {
 }
 
 // ============================================
-// TIMEFRAME MANAGER
+// TIMEFRAME MANAGER (Unchanged)
 // ============================================
 class TimeframeManager {
   constructor() {
@@ -380,7 +507,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR
+// ASSET SIMULATOR (Enhanced with activity tracking)
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -402,6 +529,10 @@ class AssetSimulator {
     this.lastLogTime = 0;
     this.isResumed = false;
     this.lastPriceData = null;
+    
+    // 🔥 Activity tracking
+    this.lastUpdateTime = Date.now();
+    this.updateCount = 0;
 
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
@@ -460,10 +591,10 @@ class AssetSimulator {
     return newPrice;
   }
 
-  // 🎯 REAL-TIME PRICE UPDATE - Unchanged (1 second interval)
-  // Frontend akan receive updates via Realtime DB subscription
   async updatePrice() {
     try {
+      const updateStartTime = Date.now();
+      
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
       
@@ -472,8 +603,6 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ Current price write (real-time, 1 second interval)
-      // Frontend subscribes to this for live updates
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -488,7 +617,6 @@ class AssetSimulator {
         currentPriceData
       );
 
-      // ✅ OHLC bars (async writes)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -514,21 +642,33 @@ class AssetSimulator {
 
       this.currentPrice = newPrice;
       this.iteration++;
+      
+      // 🔥 Track activity
+      this.lastUpdateTime = Date.now();
+      this.updateCount++;
 
       const now = Date.now();
+      const updateDuration = now - updateStartTime;
+      
+      // 🔥 Warn if update is slow
+      if (updateDuration > 1000) {
+        logger.warn(`⚠️ [${this.asset.symbol}] Slow update: ${updateDuration}ms`);
+      }
+      
       if (now - this.lastLogTime > 30000) {
         const stats = this.firebase.getStats();
         logger.info(
           `[${this.asset.symbol}] ${this.isResumed ? '🔄 RESUMED' : '🆕 FRESH'} | ` +
           `Iter ${this.iteration}: ${newPrice.toFixed(6)} ` +
           `(${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%) | ` +
-          `Writes: ${stats.successRate}%`
+          `Writes: ${stats.successRate}% | Queue: ${stats.queueSize}`
         );
         this.lastLogTime = now;
       }
 
     } catch (error) {
       logger.error(`[${this.asset.symbol}] Update error: ${error.message}`);
+      logger.error(`Stack: ${error.stack}`);
     }
   }
 
@@ -546,19 +686,24 @@ class AssetSimulator {
   }
 
   getInfo() {
+    const timeSinceUpdate = Date.now() - this.lastUpdateTime;
+    
     return {
       symbol: this.asset.symbol,
       name: this.asset.name,
       currentPrice: this.currentPrice,
       iteration: this.iteration,
       isResumed: this.isResumed,
-      path: this.realtimeDbPath
+      path: this.realtimeDbPath,
+      updateCount: this.updateCount,
+      lastUpdate: Math.floor(timeSinceUpdate / 1000),
+      isHealthy: timeSinceUpdate < 5000 // Healthy if updated in last 5 seconds
     };
   }
 }
 
 // ============================================
-// MULTI-ASSET MANAGER - BILLING OPTIMIZED
+// 🔥 MULTI-ASSET MANAGER (WITH WATCHDOG)
 // ============================================
 class MultiAssetManager {
   constructor(firebaseManager) {
@@ -568,10 +713,14 @@ class MultiAssetManager {
     this.settingsRefreshInterval = null;
     this.statsInterval = null;
     this.isRunning = false;
+    
+    // 🔥 Watchdog for stuck detection
+    this.watchdog = new Watchdog('PriceUpdateLoop', 60); // 60 second timeout
+    this.lastActivityCheck = Date.now();
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (BILLING-OPTIMIZED)...');
+    logger.info('🎯 Initializing Multi-Asset Manager (WATCHDOG EDITION)...');
     
     const assets = await this.firebase.getAssets();
     
@@ -591,13 +740,6 @@ class MultiAssetManager {
     logger.info(`✅ ${this.simulators.size} simulators initialized`);
   }
 
-  /**
-   * 🎯 BILLING OPTIMIZATION: Reduced refresh frequency
-   * 
-   * OLD: Every 2 minutes (720 reads/day per asset)
-   * NEW: Every 10 minutes (144 reads/day per asset)
-   * SAVINGS: 80% reduction in Firestore reads!
-   */
   async refreshAssets() {
     try {
       const assets = await this.firebase.getAssets();
@@ -642,12 +784,95 @@ class MultiAssetManager {
   async updateAllPrices() {
     if (this.simulators.size === 0) return;
 
-    const promises = [];
-    for (const simulator of this.simulators.values()) {
-      promises.push(simulator.updatePrice());
-    }
+    try {
+      // 🔥 Heartbeat to watchdog BEFORE processing
+      this.watchdog.heartbeat();
+      
+      const promises = [];
+      for (const simulator of this.simulators.values()) {
+        promises.push(
+          // 🔥 Add timeout per simulator
+          Promise.race([
+            simulator.updatePrice(),
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Update timeout')), 3000)
+            )
+          ]).catch(error => {
+            logger.error(`❌ Simulator update failed: ${error.message}`);
+          })
+        );
+      }
 
-    await Promise.allSettled(promises);
+      await Promise.allSettled(promises);
+      
+      // 🔥 Heartbeat AFTER successful processing
+      this.watchdog.heartbeat();
+      
+    } catch (error) {
+      logger.error(`❌ updateAllPrices error: ${error.message}`);
+      logger.error(`Stack: ${error.stack}`);
+    }
+  }
+
+  // 🔥 Recovery mechanism
+  async handleStuck() {
+    logger.error('');
+    logger.error('🔥 ================================================');
+    logger.error('🔥 INITIATING AUTO-RECOVERY');
+    logger.error('🔥 ================================================');
+    logger.error('');
+    
+    try {
+      // Log current state
+      logger.info('📊 Current State:');
+      for (const [id, simulator] of this.simulators.entries()) {
+        const info = simulator.getInfo();
+        logger.info(`   • ${info.symbol}: Last update ${info.lastUpdate}s ago, Healthy: ${info.isHealthy}`);
+      }
+      
+      // Force garbage collection if available
+      if (global.gc) {
+        logger.info('🧹 Running garbage collection...');
+        global.gc();
+      }
+      
+      const stats = this.firebase.getStats();
+      logger.info(`📊 Firebase Stats: Success ${stats.success}, Failed ${stats.failed}, Queue ${stats.queueSize}`);
+      
+      // If too many failures, restart process
+      if (stats.consecutiveFailures > 20 || stats.queueSize > 200) {
+        logger.error('🔥 Critical condition detected - restarting process...');
+        process.exit(1); // PM2 will restart
+      }
+      
+      // Clear intervals and restart
+      logger.info('🔄 Clearing intervals...');
+      if (this.updateInterval) {
+        clearInterval(this.updateInterval);
+        this.updateInterval = null;
+      }
+      
+      logger.info('⏳ Waiting 5 seconds...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      
+      logger.info('🔄 Restarting update loop...');
+      this.updateInterval = setInterval(async () => {
+        await this.updateAllPrices();
+      }, 1000);
+      
+      // Reset watchdog
+      this.watchdog.stop();
+      this.watchdog = new Watchdog('PriceUpdateLoop', 60);
+      this.watchdog.start(() => this.handleStuck());
+      
+      logger.info('✅ Recovery completed');
+      logger.info('');
+      
+    } catch (error) {
+      logger.error(`❌ Recovery failed: ${error.message}`);
+      logger.error('🔥 Forcing process restart...');
+      process.exit(1); // PM2 will restart
+    }
   }
 
   async start() {
@@ -668,18 +893,19 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v7.0 - BILLING-OPTIMIZED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v8.0 - WATCHDOG EDITION');
     logger.info('🚀 ================================================');
     logger.info('🚀 ✅ ADMIN SDK (BYPASSES RULES)');
     logger.info('🚀 ✅ REAL-TIME PRICE UPDATES (1s interval)');
-    logger.info('🚀 ✅ OPTIMIZED ASSET REFRESH (10min interval)');
+    logger.info('🚀 ✅ WATCHDOG AUTO-RECOVERY (60s timeout)');
+    logger.info('🚀 ✅ MEMORY MONITORING & GC');
     logger.info('🚀 ================================================');
     logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current Time: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`📊 Active Assets: ${this.simulators.size}`);
-    logger.info('⏱️ Price Update: 1 second (real-time for frontend)');
-    logger.info('🔄 Asset Refresh: Every 10 minutes (was 2 min)');
-    logger.info('💰 Billing Savings: 80% fewer Firestore reads');
+    logger.info('⏱️ Price Update: 1 second');
+    logger.info('🔄 Asset Refresh: Every 10 minutes');
+    logger.info('🐕 Watchdog: 60 second timeout');
     logger.info('🗑️ Cleanup: Every 1 hour (keeps 7 days)');
     logger.info('🚀 ================================================');
     logger.info('');
@@ -696,19 +922,25 @@ class MultiAssetManager {
     logger.info('================================================');
     logger.info('');
 
-    // ✅ PRICE UPDATES - 1 second (unchanged for real-time frontend)
+    // 🔥 Start watchdog
+    this.watchdog.start(() => this.handleStuck());
+
+    // Price updates - 1 second
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, 1000);
 
-    // 🎯 ASSET REFRESH - 10 minutes (optimized from 2 min)
+    // Asset refresh - 10 minutes
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
-    }, 600000); // 10 minutes = 600,000ms
+    }, 600000);
 
-    // ✅ STATS LOGGING
+    // Stats logging - 1 minute
     this.statsInterval = setInterval(() => {
       const stats = this.firebase.getStats();
+      const watchdogStatus = this.watchdog.getStatus();
+      const memUsage = process.memoryUsage();
+      
       logger.info('');
       logger.info(`📊 ================================================`);
       logger.info(`📊 STATISTICS`);
@@ -718,20 +950,19 @@ class MultiAssetManager {
       logger.info(`   Write Failed: ${stats.failed}`);
       logger.info(`   Success Rate: ${stats.successRate}%`);
       logger.info(`   Write Queue: ${stats.queueSize}`);
+      logger.info(`   Consecutive Failures: ${stats.consecutiveFailures}`);
+      logger.info(`   Last Write: ${stats.lastSuccessfulWrite}s ago`);
       logger.info(`   💰 Firestore Reads: ${stats.billing.firestoreReads}`);
       logger.info(`   💰 Est. Reads/24h: ${stats.billing.readsPer24h}`);
-      logger.info(`   💰 Time Since Reset: ${stats.billing.timeSinceReset}`);
+      logger.info(`   🐕 Watchdog: ${watchdogStatus.healthy ? '✅ HEALTHY' : '⚠️ WARNING'}`);
+      logger.info(`   🐕 Last Activity: ${watchdogStatus.lastActivity}s ago`);
+      logger.info(`   💾 Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB / ${Math.round(memUsage.heapTotal / 1024 / 1024)}MB`);
       logger.info(`📊 ================================================`);
       logger.info('');
     }, 60000);
 
-    logger.info('✅ All simulators running!');
-    logger.info('💰 BILLING OPTIMIZATIONS:');
-    logger.info('   • Asset refresh: Every 10 min (was 2 min)');
-    logger.info('   • 80% reduction in Firestore reads');
-    logger.info('   • Real-time prices: Still 1s updates for frontend');
-    logger.info('   • Frontend gets live data via Realtime DB subscription');
-    logger.info('');
+    logger.info('✅ All simulators running with watchdog protection!');
+    logger.info('🐕 Auto-recovery enabled - will detect and fix stuck conditions');
     logger.info('💡 Add new asset via API - auto-detected in 10 minutes!');
     logger.info('Press Ctrl+C to stop');
     logger.info('');
@@ -744,6 +975,11 @@ class MultiAssetManager {
     logger.info('⏹️ Stopping Multi-Asset Manager...');
     
     this.isRunning = false;
+    
+    // Stop watchdog
+    if (this.watchdog) {
+      this.watchdog.stop();
+    }
 
     if (this.updateInterval) {
       clearInterval(this.updateInterval);
@@ -781,10 +1017,12 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v7.0 - BILLING-OPTIMIZED');
+  console.log('🌐 MULTI-ASSET SIMULATOR v8.0 - WATCHDOG EDITION');
   console.log('🌐 ================================================');
   console.log(`🌐 Process TZ: ${process.env.TZ}`);
   console.log(`🌐 Current Time (WIB): ${TimezoneUtil.formatDateTime()}`);
+  console.log(`🌐 Node Version: ${process.version}`);
+  console.log(`🌐 Memory: ${Math.round(process.memoryUsage().heapTotal / 1024 / 1024)}MB`);
   console.log('🌐 ================================================');
   console.log('');
 
@@ -794,17 +1032,46 @@ async function main() {
 
     const manager = new MultiAssetManager(firebaseManager);
     
-    process.on('SIGINT', () => manager.stop());
-    process.on('SIGTERM', () => manager.stop());
-    process.on('SIGUSR2', () => manager.stop());
+    // 🔥 Enhanced signal handlers
+    process.on('SIGINT', () => {
+      logger.info('');
+      logger.info('⏹️ Received SIGINT - graceful shutdown...');
+      manager.stop();
+    });
+    
+    process.on('SIGTERM', () => {
+      logger.info('');
+      logger.info('⏹️ Received SIGTERM - graceful shutdown...');
+      manager.stop();
+    });
+    
+    process.on('SIGUSR2', () => {
+      logger.info('');
+      logger.info('⏹️ Received SIGUSR2 - graceful shutdown...');
+      manager.stop();
+    });
     
     process.on('uncaughtException', (error) => {
-      logger.error(`Uncaught Exception: ${error.message}`);
+      logger.error('');
+      logger.error('❌ ================================================');
+      logger.error('❌ UNCAUGHT EXCEPTION');
+      logger.error('❌ ================================================');
+      logger.error(`Error: ${error.message}`);
+      logger.error(`Stack: ${error.stack}`);
+      logger.error('❌ ================================================');
+      logger.error('');
       manager.stop();
     });
     
     process.on('unhandledRejection', (reason, promise) => {
-      logger.error(`Unhandled Rejection: ${reason}`);
+      logger.error('');
+      logger.error('❌ ================================================');
+      logger.error('❌ UNHANDLED PROMISE REJECTION');
+      logger.error('❌ ================================================');
+      logger.error(`Reason: ${reason}`);
+      logger.error(`Promise: ${promise}`);
+      logger.error('❌ ================================================');
+      logger.error('');
       manager.stop();
     });
 
@@ -812,8 +1079,23 @@ async function main() {
     
   } catch (error) {
     logger.error(`❌ Fatal error: ${error.message}`);
+    logger.error(`Stack: ${error.stack}`);
     process.exit(1);
   }
+}
+
+// 🔥 Enable manual GC if running with --expose-gc
+if (global.gc) {
+  logger.info('🧹 Manual garbage collection enabled');
+  setInterval(() => {
+    const before = process.memoryUsage().heapUsed;
+    global.gc();
+    const after = process.memoryUsage().heapUsed;
+    const freed = before - after;
+    if (freed > 1024 * 1024) { // More than 1MB freed
+      logger.debug(`🧹 GC freed ${Math.round(freed / 1024 / 1024)}MB`);
+    }
+  }, 300000); // Every 5 minutes
 }
 
 main();
