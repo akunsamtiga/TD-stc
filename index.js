@@ -1,12 +1,11 @@
 // ============================================
-// MULTI-ASSET SIMULATOR v8.0 - STABLE 24/7
+// MULTI-ASSET SIMULATOR v9.0 - SELF-HEALING
 // ============================================
-// ✅ Enhanced stability for 24/7 operation
-// ✅ Multi-timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1d
-// ✅ Optimized for Firebase Free Tier (360 MB/day)
-// ✅ Automatic recovery & reconnection
-// ✅ Memory leak prevention
-// ✅ Graceful degradation
+// ✅ Auto-reconnect when write fails
+// ✅ Aggressive connection monitoring
+// ✅ Auto-restart on stale connection
+// ✅ Independent from backend
+// ============================================
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -80,7 +79,7 @@ class TimezoneUtil {
 }
 
 // ============================================
-// FIREBASE MANAGER - ENHANCED STABILITY
+// FIREBASE MANAGER - SELF-HEALING
 // ============================================
 class FirebaseManager {
   constructor() {
@@ -91,7 +90,6 @@ class FirebaseManager {
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 5000;
     
-    // Write management
     this.writeQueue = [];
     this.isProcessingQueue = false;
     this.writeStats = { 
@@ -101,25 +99,25 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
-    // Data retention (optimized for Free Tier 1GB storage)
-    this.RETENTION_SMALL_TF = 3; // 1m, 5m, 15m: 3 days
-    this.RETENTION_MEDIUM_TF = 5; // 30m, 1h: 5 days
-    this.RETENTION_LARGE_TF = 7; // 4h, 1d: 7 days
+    this.RETENTION_SMALL_TF = 3;
+    this.RETENTION_MEDIUM_TF = 5;
+    this.RETENTION_LARGE_TF = 7;
     this.lastCleanupTime = 0;
-    this.CLEANUP_INTERVAL = 3600000; // 1 hour
+    this.CLEANUP_INTERVAL = 3600000;
     
-    // Read tracking for billing
     this.firestoreReadCount = 0;
     this.lastReadReset = Date.now();
     this.dailyTransferEstimate = 0;
     
-    // Connection health
     this.lastHeartbeat = Date.now();
     this.heartbeatInterval = null;
     
-    // Error tracking
     this.consecutiveErrors = 0;
-    this.MAX_CONSECUTIVE_ERRORS = 5;
+    this.MAX_CONSECUTIVE_ERRORS = 3; // ✅ Reduced from 5
+    
+    // ✅ NEW: Aggressive stale connection detection
+    this.STALE_CONNECTION_THRESHOLD = 120000; // 2 minutes
+    this.staleCheckInterval = null;
   }
 
   async initialize() {
@@ -134,12 +132,16 @@ class FirebaseManager {
         throw new Error('Firebase credentials incomplete in .env');
       }
 
-      if (!admin.apps.length) {
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount),
-          databaseURL: process.env.FIREBASE_REALTIME_DB_URL,
-        });
+      // ✅ Reset admin if exists (for reconnection)
+      if (admin.apps.length > 0) {
+        logger.warn('🔄 Existing Firebase app detected, resetting...');
+        await Promise.all(admin.apps.map(app => app?.delete()));
       }
+
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: process.env.FIREBASE_REALTIME_DB_URL,
+      });
 
       this.db = admin.firestore();
       this.db.settings({
@@ -149,22 +151,21 @@ class FirebaseManager {
 
       this.realtimeDbAdmin = admin.database();
       
-      // Test connection
       await this.testConnection();
       
       this.isConnected = true;
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.info('✅ Firebase Admin SDK initialized (STABLE 24/7 MODE)');
+      logger.info('✅ Firebase Admin SDK initialized (SELF-HEALING v9.0)');
       logger.info('✅ Firestore ready');
-      logger.info('✅ Realtime DB Admin SDK ready');
-      logger.info('💾 Storage optimization: 1GB limit');
-      logger.info('📊 Transfer limit: 360 MB/day');
+      logger.info('✅ Realtime DB ready');
+      logger.info('🔄 Auto-recovery: ENABLED');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
       this.startHeartbeat();
+      this.startStaleConnectionMonitor(); // ✅ NEW
       
       return true;
     } catch (error) {
@@ -176,12 +177,8 @@ class FirebaseManager {
 
   async testConnection() {
     try {
-      // Test Firestore
       await this.db.collection('_health_check').limit(1).get();
-      
-      // Test Realtime DB
       await this.realtimeDbAdmin.ref('/.info/connected').once('value');
-      
       logger.debug('✅ Connection test passed');
       return true;
     } catch (error) {
@@ -194,29 +191,47 @@ class FirebaseManager {
     this.isConnected = false;
     this.consecutiveErrors++;
     
-    if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
-      logger.error(`❌ Too many consecutive errors (${this.consecutiveErrors}). Critical failure.`);
-      throw new Error('Firebase connection critically failed');
-    }
+    logger.error(`❌ Connection error #${this.consecutiveErrors}: ${error.message}`);
 
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
       
-      logger.warn(`⚠️ Reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms...`);
+      logger.warn(`🔄 Reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms...`);
       
       await new Promise(resolve => setTimeout(resolve, delay));
       
       try {
         await this.initialize();
+        logger.info('✅ Reconnection successful!');
       } catch (retryError) {
         logger.error(`❌ Reconnection failed: ${retryError.message}`);
       }
+    } else {
+      logger.error('❌ Max reconnection attempts reached, will retry in 60s...');
+      await new Promise(resolve => setTimeout(resolve, 60000));
+      this.reconnectAttempts = 0;
+      await this.initialize();
     }
   }
 
+  // ✅ NEW: Detect stale connections
+  startStaleConnectionMonitor() {
+    this.staleCheckInterval = setInterval(() => {
+      const timeSinceLastSuccess = Date.now() - this.writeStats.lastSuccessTime;
+      
+      if (timeSinceLastSuccess > this.STALE_CONNECTION_THRESHOLD && this.writeStats.success > 0) {
+        logger.error(`❌ STALE CONNECTION DETECTED! No writes in ${Math.floor(timeSinceLastSuccess / 1000)}s`);
+        logger.warn('🔄 Forcing reconnection...');
+        
+        // Force reconnection
+        this.isConnected = false;
+        this.handleConnectionError(new Error('Stale connection detected'));
+      }
+    }, 15000); // Check every 15 seconds
+  }
+
   startHeartbeat() {
-    // Monitor connection health every 30 seconds
     this.heartbeatInterval = setInterval(async () => {
       try {
         await this.realtimeDbAdmin.ref('/.info/serverTimeOffset').once('value');
@@ -226,12 +241,12 @@ class FirebaseManager {
         logger.warn(`⚠️ Heartbeat failed: ${error.message}`);
         this.consecutiveErrors++;
         
-        if (this.consecutiveErrors >= 3) {
+        if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
           logger.error('❌ Multiple heartbeat failures, attempting reconnection...');
           await this.handleConnectionError(error);
         }
       }
-    }, 30000);
+    }, 15000); // ✅ Reduced from 30s to 15s
   }
 
   async getAssets() {
@@ -260,9 +275,7 @@ class FirebaseManager {
       });
 
       logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} assets`);
-      
-      // Estimate transfer size (rough)
-      this.dailyTransferEstimate += 0.001; // ~1KB per read
+      this.dailyTransferEstimate += 0.001;
 
       return assets;
     } catch (error) {
@@ -306,11 +319,10 @@ class FirebaseManager {
       try {
         await this.realtimeDbAdmin.ref(path).set(data);
         this.writeStats.success++;
-        this.writeStats.lastSuccessTime = Date.now();
+        this.writeStats.lastSuccessTime = Date.now(); // ✅ Update success time
         this.consecutiveErrors = 0;
         
-        // Estimate transfer
-        this.dailyTransferEstimate += JSON.stringify(data).length / 1024 / 1024; // MB
+        this.dailyTransferEstimate += JSON.stringify(data).length / 1024 / 1024;
         
         return true;
       } catch (error) {
@@ -321,7 +333,9 @@ class FirebaseManager {
           this.consecutiveErrors++;
           logger.error(`❌ Write failed at ${path}: ${error.message}`);
           
-          if (this.consecutiveErrors >= 3) {
+          // ✅ Trigger reconnection faster
+          if (this.consecutiveErrors >= 2) {
+            logger.warn('🔄 Multiple write failures, reconnecting...');
             await this.handleConnectionError(error);
           }
           
@@ -336,7 +350,6 @@ class FirebaseManager {
     this.writeStats.queued++;
     this.writeQueue.push({ path, data, addedAt: Date.now() });
     
-    // Prevent queue overflow
     if (this.writeQueue.length > 1000) {
       logger.warn(`⚠️ Write queue overflow (${this.writeQueue.length}), dropping oldest entries`);
       this.writeQueue = this.writeQueue.slice(-500);
@@ -351,14 +364,12 @@ class FirebaseManager {
       
       this.isProcessingQueue = true;
       
-      // Process in batches of 10
       const batch = this.writeQueue.splice(0, 10);
       
-      const results = await Promise.allSettled(
+      await Promise.allSettled(
         batch.map(({ path, data }) => this.setRealtimeValue(path, data, 1))
       );
       
-      // Clean up old queued items (older than 5 minutes)
       const now = Date.now();
       this.writeQueue = this.writeQueue.filter(item => now - item.addedAt < 300000);
       
@@ -395,7 +406,6 @@ class FirebaseManager {
   async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
-    // Different retention for different timeframes (optimize Free Tier storage)
     const timeframes = [
       { tf: '1m', retention: this.RETENTION_SMALL_TF },
       { tf: '5m', retention: this.RETENTION_SMALL_TF },
@@ -421,7 +431,6 @@ class FirebaseManager {
           if (oldKeys.length > 0) {
             logger.info(`  🗑️ Deleting ${oldKeys.length} old ${tf} bars for ${asset.symbol}`);
             
-            // Batch delete for efficiency
             const updates = {};
             oldKeys.forEach(key => {
               updates[`${path}/ohlc_${tf}/${key}`] = null;
@@ -455,6 +464,7 @@ class FirebaseManager {
         reconnectAttempts: this.reconnectAttempts,
         lastHeartbeat: `${Math.floor((now - this.lastHeartbeat) / 1000)}s ago`,
         consecutiveErrors: this.consecutiveErrors,
+        timeSinceLastWrite: `${Math.floor(timeSinceLastSuccess / 1000)}s ago`, // ✅ NEW
       },
       writes: {
         success: this.writeStats.success,
@@ -485,7 +495,10 @@ class FirebaseManager {
       clearInterval(this.heartbeatInterval);
     }
     
-    // Process remaining queue
+    if (this.staleCheckInterval) {
+      clearInterval(this.staleCheckInterval);
+    }
+    
     if (this.writeQueue.length > 0) {
       logger.info(`📤 Processing ${this.writeQueue.length} remaining writes...`);
       
@@ -502,19 +515,18 @@ class FirebaseManager {
 }
 
 // ============================================
-// TIMEFRAME MANAGER - MULTI-TIMEFRAME
+// TIMEFRAME MANAGER
 // ============================================
 class TimeframeManager {
   constructor() {
-    // 🎯 COMPLETE TIMEFRAMES: 1m, 5m, 15m, 30m, 1h, 4h, 1d
     this.timeframes = {
       '1m': 60,
       '5m': 300,
       '15m': 900,
-      '30m': 1800,    // ✅ Added
+      '30m': 1800,
       '1h': 3600,
-      '4h': 14400,    // ✅ Added
-      '1d': 86400,    // ✅ Added
+      '4h': 14400,
+      '1d': 86400,
     };
 
     this.bars = {};
@@ -538,7 +550,6 @@ class TimeframeManager {
       const barTimestamp = this.getBarTimestamp(timestamp, seconds);
 
       if (!this.bars[tf] || this.bars[tf].timestamp !== barTimestamp) {
-        // Bar completed
         if (this.bars[tf]) {
           completedBars[tf] = {
             ...this.bars[tf],
@@ -547,7 +558,6 @@ class TimeframeManager {
           this.barsCreated[tf]++;
         }
 
-        // New bar
         this.bars[tf] = {
           timestamp: barTimestamp,
           open: price,
@@ -558,7 +568,6 @@ class TimeframeManager {
           isCompleted: false
         };
       } else {
-        // Update current bar
         this.bars[tf].high = Math.max(this.bars[tf].high, price);
         this.bars[tf].low = Math.min(this.bars[tf].low, price);
         this.bars[tf].close = price;
@@ -588,7 +597,7 @@ class TimeframeManager {
 }
 
 // ============================================
-// ASSET SIMULATOR - ENHANCED STABILITY
+// ASSET SIMULATOR
 // ============================================
 class AssetSimulator {
   constructor(asset, firebaseManager) {
@@ -611,9 +620,8 @@ class AssetSimulator {
     this.isResumed = false;
     this.lastPriceData = null;
     
-    // Error tracking
     this.consecutiveErrors = 0;
-    this.MAX_ERRORS = 5;
+    this.MAX_ERRORS = 3; // ✅ Reduced from 5
 
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
@@ -665,14 +673,13 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // Bounds checking with soft bounce
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice;
-      this.lastDirection = 1; // Force upward
+      this.lastDirection = 1;
     }
     if (newPrice > this.maxPrice) {
       newPrice = this.maxPrice;
-      this.lastDirection = -1; // Force downward
+      this.lastDirection = -1;
     }
     
     return newPrice;
@@ -688,7 +695,6 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ Current price (real-time for frontend)
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -707,15 +713,15 @@ class AssetSimulator {
         this.consecutiveErrors++;
         
         if (this.consecutiveErrors >= this.MAX_ERRORS) {
-          logger.error(`❌ [${this.asset.symbol}] Too many errors, skipping update cycle`);
+          logger.error(`❌ [${this.asset.symbol}] Too many errors, pausing...`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
           this.consecutiveErrors = 0;
-          return;
         }
+        return;
       } else {
         this.consecutiveErrors = 0;
       }
 
-      // ✅ OHLC bars (all timeframes: 1m, 5m, 15m, 30m, 1h, 4h, 1d)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -742,7 +748,6 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
-      // Logging every 30 seconds
       const now = Date.now();
       if (now - this.lastLogTime > 30000) {
         logger.info(
@@ -792,7 +797,7 @@ class AssetSimulator {
 }
 
 // ============================================
-// MULTI-ASSET MANAGER - STABLE 24/7
+// MULTI-ASSET MANAGER
 // ============================================
 class MultiAssetManager {
   constructor(firebaseManager) {
@@ -804,13 +809,11 @@ class MultiAssetManager {
     this.healthCheckInterval = null;
     this.isRunning = false;
     this.isPaused = false;
-    
-    // Graceful shutdown
     this.isShuttingDown = false;
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (STABLE 24/7)...');
+    logger.info('🎯 Initializing Multi-Asset Manager (SELF-HEALING v9.0)...');
     
     const assets = await this.firebase.getAssets();
     
@@ -844,7 +847,6 @@ class MultiAssetManager {
       const currentIds = new Set(this.simulators.keys());
       const newIds = new Set(assets.map(a => a.id));
 
-      // Remove deleted assets
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
@@ -853,7 +855,6 @@ class MultiAssetManager {
         }
       }
 
-      // Add new assets
       for (const asset of assets) {
         if (!currentIds.has(asset.id)) {
           logger.info(`➕ New asset: ${asset.symbol}`);
@@ -866,7 +867,6 @@ class MultiAssetManager {
             logger.error(`❌ Failed to add ${asset.symbol}: ${error.message}`);
           }
         } else {
-          // Update settings
           const simulator = this.simulators.get(asset.id);
           simulator.updateSettings(asset);
         }
@@ -893,7 +893,6 @@ class MultiAssetManager {
     this.healthCheckInterval = setInterval(() => {
       const stats = this.firebase.getStats();
       
-      // Check connection health
       if (!stats.connection.isConnected) {
         logger.warn('⚠️ Firebase disconnected, pausing updates...');
         this.isPaused = true;
@@ -902,20 +901,18 @@ class MultiAssetManager {
         this.isPaused = false;
       }
       
-      // Check if writes are succeeding
       const timeSinceLastSuccess = Date.now() - this.firebase.writeStats.lastSuccessTime;
       if (timeSinceLastSuccess > 60000 && this.firebase.writeStats.success > 0) {
         logger.warn(`⚠️ No successful writes in ${Math.floor(timeSinceLastSuccess / 1000)}s`);
       }
       
-      // Check transfer limit
       if (stats.billing.estimatedDailyTransfer && 
           parseFloat(stats.billing.estimatedDailyTransfer) > 300) {
         logger.error('❌ Daily transfer limit exceeded! Pausing...');
         this.isPaused = true;
       }
       
-    }, 60000); // Every minute
+    }, 30000); // Every 30 seconds
   }
 
   async start() {
@@ -936,49 +933,43 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v8.0 - STABLE 24/7');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v9.0 - SELF-HEALING');
     logger.info('🚀 ================================================');
-    logger.info('🚀 ✅ Enhanced Stability & Error Recovery');
-    logger.info('🚀 ✅ Multi-Timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1d');
-    logger.info('🚀 ✅ Firebase Free Tier Optimized');
+    logger.info('🚀 ✅ Auto-Reconnect on Write Failure');
+    logger.info('🚀 ✅ Stale Connection Detection (2min)');
+    logger.info('🚀 ✅ Aggressive Error Recovery');
+    logger.info('🚀 ✅ Independent from Backend');
     logger.info('🚀 ================================================');
-    logger.info(`🌏 Timezone: Asia/Jakarta (WIB = UTC+7)`);
+    logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`📊 Assets: ${this.simulators.size}`);
     logger.info('⏱️ Update: 1 second (real-time)');
     logger.info('🔄 Refresh: 10 minutes');
-    logger.info('💾 Storage: Optimized for 1GB limit');
-    logger.info('📊 Transfer: Monitored for 360MB/day');
-    logger.info('🗑️ Cleanup: Hourly (3-7 days retention)');
+    logger.info('💊 Health Check: 15 seconds');
     logger.info('🚀 ================================================');
     logger.info('');
 
-    // ✅ Price updates - 1 second
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, 1000);
 
-    // ✅ Asset refresh - 10 minutes
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
     }, 600000);
 
-    // ✅ Stats logging - 1 minute
     this.statsInterval = setInterval(() => {
       this.logStats();
     }, 60000);
 
-    // ✅ Health check - 1 minute
     this.startHealthCheck();
 
     logger.info('✅ All systems running!');
     logger.info('');
-    logger.info('💡 System Features:');
-    logger.info('   • Auto-recovery from errors');
-    logger.info('   • Graceful degradation on issues');
-    logger.info('   • Smart write queue management');
-    logger.info('   • Memory leak prevention');
-    logger.info('   • Transfer limit monitoring');
+    logger.info('💡 Self-Healing Features:');
+    logger.info('   • Auto-detect stale connection (2min)');
+    logger.info('   • Force reconnect on write failure');
+    logger.info('   • Aggressive error recovery (3 errors)');
+    logger.info('   • Independent Firebase connection');
     logger.info('');
     logger.info('Press Ctrl+C for graceful shutdown');
     logger.info('');
@@ -989,13 +980,14 @@ class MultiAssetManager {
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT`);
+    logger.info(`📊 STATUS REPORT - v9.0 SELF-HEALING`);
     logger.info(`📊 ================================================`);
     logger.info(`   Simulators: ${this.simulators.size}`);
-    logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
+    logger.info(`   Status: ${this.isPaused ? '⸫ PAUSED' : '▶️ RUNNING'}`);
     logger.info(`   Connection: ${stats.connection.isConnected ? '✅ OK' : '❌ DOWN'}`);
     logger.info(`   Heartbeat: ${stats.connection.lastHeartbeat}`);
     logger.info(`   Errors: ${stats.connection.consecutiveErrors}`);
+    logger.info(`   Last Write: ${stats.connection.timeSinceLastWrite}`); // ✅ NEW
     logger.info('');
     logger.info(`   Writes Success: ${stats.writes.success}`);
     logger.info(`   Writes Failed: ${stats.writes.failed}`);
@@ -1020,7 +1012,6 @@ class MultiAssetManager {
     
     this.isRunning = false;
 
-    // Clear all intervals
     if (this.updateInterval) clearInterval(this.updateInterval);
     if (this.settingsRefreshInterval) clearInterval(this.settingsRefreshInterval);
     if (this.statsInterval) clearInterval(this.statsInterval);
@@ -1029,7 +1020,6 @@ class MultiAssetManager {
     logger.info('📊 Final Statistics:');
     this.logStats();
     
-    // Shutdown Firebase
     await this.firebase.shutdown();
     
     logger.info('✅ Graceful shutdown complete');
@@ -1041,22 +1031,21 @@ class MultiAssetManager {
 }
 
 // ============================================
-// MAIN - PRODUCTION READY
+// MAIN
 // ============================================
 async function main() {
   console.log('');
-  console.log('🌏 ================================================');
-  console.log('🌏 MULTI-ASSET SIMULATOR v8.0 - STABLE 24/7');
-  console.log('🌏 ================================================');
-  console.log(`🌏 Process TZ: ${process.env.TZ}`);
-  console.log(`🌏 Current Time: ${TimezoneUtil.formatDateTime()}`);
-  console.log('🌏 ================================================');
+  console.log('🌐 ================================================');
+  console.log('🌐 MULTI-ASSET SIMULATOR v9.0 - SELF-HEALING');
+  console.log('🌐 ================================================');
+  console.log(`🌐 Process TZ: ${process.env.TZ}`);
+  console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
+  console.log('🌐 ================================================');
   console.log('');
 
   const firebaseManager = new FirebaseManager();
   const manager = new MultiAssetManager(firebaseManager);
   
-  // Graceful shutdown handlers
   const shutdownHandler = async () => {
     await manager.stop();
   };
@@ -1065,23 +1054,17 @@ async function main() {
   process.on('SIGTERM', shutdownHandler);
   process.on('SIGUSR2', shutdownHandler);
   
-  // Error handlers - prevent crash
   process.on('uncaughtException', (error) => {
     logger.error(`💥 Uncaught Exception: ${error.message}`);
     logger.error(error.stack);
-    
-    // Don't exit immediately, try to recover
-    logger.warn('⚠️ Attempting to continue after uncaught exception...');
+    logger.warn('⚠️ Attempting to continue...');
   });
   
   process.on('unhandledRejection', (reason, promise) => {
     logger.error(`💥 Unhandled Rejection: ${reason}`);
-    
-    // Don't exit, log and continue
     logger.warn('⚠️ Continuing after unhandled rejection...');
   });
   
-  // Memory monitoring
   setInterval(() => {
     const usage = process.memoryUsage();
     const heapUsedMB = Math.round(usage.heapUsed / 1024 / 1024);
@@ -1095,7 +1078,7 @@ async function main() {
         global.gc();
       }
     }
-  }, 300000); // Every 5 minutes
+  }, 300000);
 
   try {
     const initialized = await firebaseManager.initialize();
@@ -1114,5 +1097,4 @@ async function main() {
   }
 }
 
-// Start the simulator
 main();
