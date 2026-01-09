@@ -1,5 +1,5 @@
 {
-  "name": "idx-stc-trading-simulator",
+  "name": "multi-asset-simulator",
   "version": "2.0.0",
   "description": "Fixed Multi-Timeframe Trading Simulator with Complete OHLC Generation",
   "main": "index.js",
@@ -9,10 +9,10 @@
     "dev": "node --watch index.js",
     "test": "node test.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
-    "pm2:stop": "pm2 stop idx-stc-simulator",
-    "pm2:restart": "pm2 restart idx-stc-simulator",
-    "pm2:delete": "pm2 delete idx-stc-simulator",
-    "pm2:logs": "pm2 logs idx-stc-simulator",
+    "pm2:stop": "pm2 stop multi-asset-simulator",
+    "pm2:restart": "pm2 restart multi-asset-simulator",
+    "pm2:delete": "pm2 delete multi-asset-simulator",
+    "pm2:logs": "pm2 logs multi-asset-simulator",
     "pm2:monit": "pm2 monit",
     "clean": "rm -f simulator.log*"
   },

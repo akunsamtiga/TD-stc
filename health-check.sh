@@ -1,10 +1,3 @@
-#!/bin/bash
-
-# ============================================
-# SIMULATOR HEALTH CHECK - ENHANCED
-# ============================================
-# Comprehensive health monitoring for 24/7 operation
-
 echo "🏥 Multi-Asset Simulator Health Check"
 echo "======================================"
 echo ""

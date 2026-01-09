@@ -79,7 +79,9 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
+    // ✅ UPDATED: 1 Second retention = 2 hours
     this.RETENTION_DAYS = {
+      '1s': 0.0833,  // 2 hours in days (2/24)
       '1m': 2,
       '5m': 2,
       '15m': 3,
@@ -136,11 +138,11 @@ class FirebaseManager {
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.info('✅ Firebase Admin SDK initialized (OPTIMIZED MODE)');
+      logger.info('✅ Firebase Admin SDK initialized (1-SECOND MODE)');
       logger.info('✅ Firestore ready');
       logger.info('✅ Realtime DB Admin SDK ready');
-      logger.info('💾 Storage: Optimized for Free Tier');
-      logger.info('📊 Write reduction: Enabled');
+      logger.info('⚡ 1-SECOND TRADING: ENABLED');
+      logger.info('💾 1s OHLC Retention: 2 hours');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -341,7 +343,7 @@ class FirebaseManager {
         return;
       }
 
-      logger.info('🗑️ Starting automatic cleanup...');
+      logger.info('🗑️ Starting automatic cleanup (including 1s bars)...');
       
       try {
         const assets = await this.getAssets();
@@ -363,6 +365,7 @@ class FirebaseManager {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
+      { tf: '1s', retention: this.RETENTION_DAYS['1s'] },  // ✅ ADDED
       { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
       { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
       { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
@@ -467,9 +470,11 @@ class FirebaseManager {
   }
 }
 
+// ✅ UPDATED: Added 1-second timeframe
 class TimeframeManager {
   constructor() {
     this.timeframes = {
+      '1s': 1,      // ✅ ADDED: 1 second
       '1m': 60,
       '5m': 300,
       '15m': 900,
@@ -571,7 +576,7 @@ class AssetSimulator {
     this.MAX_ERRORS = 5;
     
     this.lastPriceUpdateTime = 0;
-    this.PRICE_UPDATE_INTERVAL = 2000;
+    this.PRICE_UPDATE_INTERVAL = 1000; // ✅ CHANGED: 1 second for 1s trading
 
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
@@ -581,7 +586,8 @@ class AssetSimulator {
     logger.info(`   Path: ${this.realtimeDbPath}`);
     logger.info(`   Initial: ${this.initialPrice}`);
     logger.info(`   Range: ${this.minPrice} - ${this.maxPrice}`);
-    logger.info(`   Update: Every 2s (optimized)`);
+    logger.info(`   Update: Every 1 second (1s trading enabled)`);
+    logger.info(`   OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d`);
   }
 
   async loadLastPrice() {
@@ -639,6 +645,7 @@ class AssetSimulator {
     try {
       const now = Date.now();
       
+      // ✅ CHANGED: Update every 1 second for 1s bars
       if (now - this.lastPriceUpdateTime < this.PRICE_UPDATE_INTERVAL) {
         return;
       }
@@ -679,6 +686,7 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
+      // ✅ Write completed bars for ALL timeframes including 1s
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -706,10 +714,12 @@ class AssetSimulator {
       this.iteration++;
 
       if (now - this.lastLogTime > 30000) {
+        const bars1s = this.tfManager.barsCreated['1s'] || 0;
         logger.info(
           `[${this.asset.symbol}] ${this.isResumed ? '🔄' : '🆕'} | ` +
           `#${this.iteration}: ${newPrice.toFixed(6)} ` +
-          `(${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%)`
+          `(${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%) | ` +
+          `1s bars: ${bars1s}`
         );
         this.lastLogTime = now;
       }
@@ -748,6 +758,7 @@ class AssetSimulator {
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
       consecutiveErrors: this.consecutiveErrors,
+      bars1s: this.tfManager.barsCreated['1s'] || 0,
     };
   }
 }
@@ -767,7 +778,7 @@ class MultiAssetManager {
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (OPTIMIZED)...');
+    logger.info('🎯 Initializing Multi-Asset Manager (1-SECOND MODE)...');
     
     const assets = await this.firebase.getAssets();
     
@@ -881,25 +892,27 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v9.0 - OPTIMIZED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v10.0 - 1-SECOND MODE');
     logger.info('🚀 ================================================');
-    logger.info('🚀 ✅ Reduced Write Frequency (2s interval)');
-    logger.info('🚀 ✅ Optimized Data Retention');
-    logger.info('🚀 ✅ Firebase Free Tier Optimized');
+    logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
+    logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
+    logger.info('🚀 ⚡ Update Interval: 1 second');
+    logger.info('🚀 ⚡ Settlement: Backend 1 second');
     logger.info('🚀 ================================================');
-    logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
+    logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`📊 Assets: ${this.simulators.size}`);
-    logger.info('⏱️ Update: 2 seconds (optimized)');
+    logger.info('⏱️ Update: 1 second (1s trading)');
     logger.info('🔄 Refresh: 10 minutes');
-    logger.info('💾 Storage: Optimized');
+    logger.info('💾 1s Retention: 2 hours');
     logger.info('🗑️ Cleanup: Every 2 hours');
     logger.info('🚀 ================================================');
     logger.info('');
 
+    // ✅ UPDATED: 1 second interval
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
-    }, 2000);
+    }, 1000); // ✅ Changed from 2000 to 1000
 
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
@@ -913,11 +926,11 @@ class MultiAssetManager {
 
     logger.info('✅ All systems running!');
     logger.info('');
-    logger.info('💡 Optimizations Active:');
-    logger.info('   • Write frequency: 2s (reduced from 1s)');
-    logger.info('   • Batch queue processing');
-    logger.info('   • Smart data retention');
-    logger.info('   • Connection pooling');
+    logger.info('💡 1-Second Trading Active:');
+    logger.info('   • Price updates: Every 1 second');
+    logger.info('   • OHLC 1s bars: Generated every second');
+    logger.info('   • Backend settlement: Every 1 second');
+    logger.info('   • Perfect sync for instant trading');
     logger.info('');
     logger.info('Press Ctrl+C for graceful shutdown');
     logger.info('');
@@ -926,15 +939,24 @@ class MultiAssetManager {
   logStats() {
     const stats = this.firebase.getStats();
     
+    // Get 1s bar statistics from all simulators
+    let total1sBars = 0;
+    for (const sim of this.simulators.values()) {
+      total1sBars += sim.tfManager.barsCreated['1s'] || 0;
+    }
+    
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT`);
+    logger.info(`📊 STATUS REPORT (1-SECOND MODE)`);
     logger.info(`📊 ================================================`);
     logger.info(`   Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
     logger.info(`   Connection: ${stats.connection.isConnected ? '✅ OK' : '❌ DOWN'}`);
     logger.info(`   Heartbeat: ${stats.connection.lastHeartbeat}`);
     logger.info(`   Errors: ${stats.connection.consecutiveErrors}`);
+    logger.info('');
+    logger.info(`   ⚡ 1s Bars Created: ${total1sBars}`);
+    logger.info(`   ⚡ Update Rate: 1 second`);
     logger.info('');
     logger.info(`   Writes Success: ${stats.writes.success}`);
     logger.info(`   Writes Failed: ${stats.writes.failed}`);
@@ -979,12 +1001,13 @@ class MultiAssetManager {
 
 async function main() {
   console.log('');
-  console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v9.0 - OPTIMIZED');
-  console.log('🌐 ================================================');
-  console.log(`🌐 Process TZ: ${process.env.TZ}`);
-  console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
-  console.log('🌐 ================================================');
+  console.log('🌍 ================================================');
+  console.log('🌍 MULTI-ASSET SIMULATOR v10.0 - 1-SECOND MODE');
+  console.log('🌍 ================================================');
+  console.log(`🌍 Process TZ: ${process.env.TZ}`);
+  console.log(`🌍 Current Time: ${TimezoneUtil.formatDateTime()}`);
+  console.log('🌍 ⚡ 1-SECOND TRADING: ENABLED');
+  console.log('🌍 ================================================');
   console.log('');
 
   const firebaseManager = new FirebaseManager();
