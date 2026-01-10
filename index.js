@@ -1,3 +1,6 @@
+// trading-simulator/index.js
+// ✅ UPDATED: Skip crypto assets (they use CryptoCompare API directly)
+
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -79,9 +82,8 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
-    // ✅ UPDATED: 1 Second retention = 2 hours
     this.RETENTION_DAYS = {
-      '1s': 0.0833,  // 2 hours in days (2/24)
+      '1s': 0.0833,  // 2 hours
       '1m': 2,
       '5m': 2,
       '15m': 3,
@@ -117,6 +119,8 @@ class FirebaseManager {
         throw new Error('Firebase credentials incomplete in .env');
       }
 
+      logger.log('info', '⚡ Initializing Firebase (CRYPTO-AWARE MODE)...');
+
       if (!admin.apps.length) {
         admin.initializeApp({
           credential: admin.credential.cert(serviceAccount),
@@ -138,11 +142,11 @@ class FirebaseManager {
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.info('✅ Firebase Admin SDK initialized (1-SECOND MODE)');
-      logger.info('✅ Firestore ready');
-      logger.info('✅ Realtime DB Admin SDK ready');
-      logger.info('⚡ 1-SECOND TRADING: ENABLED');
-      logger.info('💾 1s OHLC Retention: 2 hours');
+      logger.log('info', '✅ Firebase Admin SDK initialized (CRYPTO-AWARE)');
+      logger.log('info', '✅ Firestore ready');
+      logger.log('info', '✅ Realtime DB Admin SDK ready');
+      logger.log('info', '💎 Crypto assets will use CryptoCompare API');
+      logger.log('info', '📊 Normal assets will be simulated');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -211,6 +215,9 @@ class FirebaseManager {
     }, 60000);
   }
 
+  /**
+   * ✅ UPDATED: Filter out crypto assets (category: 'crypto')
+   */
   async getAssets() {
     if (!this.isConnected) {
       logger.warn('⚠️ Firebase not connected, skipping asset fetch');
@@ -228,6 +235,13 @@ class FirebaseManager {
       snapshot.forEach(doc => {
         const data = doc.data();
         
+        // ✅ FILTER: Skip crypto assets (they use CryptoCompare API directly)
+        if (data.category === 'crypto') {
+          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (handled by CryptoCompare)`);
+          return; // Skip this asset
+        }
+        
+        // Only include normal assets that need simulation
         if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
           assets.push({ 
             id: doc.id, 
@@ -236,7 +250,7 @@ class FirebaseManager {
         }
       });
 
-      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} assets`);
+      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} normal assets (crypto assets excluded)`);
 
       return assets;
     } catch (error) {
@@ -343,7 +357,7 @@ class FirebaseManager {
         return;
       }
 
-      logger.info('🗑️ Starting automatic cleanup (including 1s bars)...');
+      logger.info('🗑️ Starting automatic cleanup...');
       
       try {
         const assets = await this.getAssets();
@@ -365,7 +379,7 @@ class FirebaseManager {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
-      { tf: '1s', retention: this.RETENTION_DAYS['1s'] },  // ✅ ADDED
+      { tf: '1s', retention: this.RETENTION_DAYS['1s'] },
       { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
       { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
       { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
@@ -470,11 +484,10 @@ class FirebaseManager {
   }
 }
 
-// ✅ UPDATED: Added 1-second timeframe
 class TimeframeManager {
   constructor() {
     this.timeframes = {
-      '1s': 1,      // ✅ ADDED: 1 second
+      '1s': 1,
       '1m': 60,
       '5m': 300,
       '15m': 900,
@@ -576,18 +589,17 @@ class AssetSimulator {
     this.MAX_ERRORS = 5;
     
     this.lastPriceUpdateTime = 0;
-    this.PRICE_UPDATE_INTERVAL = 1000; // ✅ CHANGED: 1 second for 1s trading
+    this.PRICE_UPDATE_INTERVAL = 1000;
 
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
     logger.info('');
     logger.info(`✅ Simulator initialized: ${asset.symbol}`);
     logger.info(`   Name: ${asset.name}`);
+    logger.info(`   Category: ${asset.category || 'normal'}`);
     logger.info(`   Path: ${this.realtimeDbPath}`);
     logger.info(`   Initial: ${this.initialPrice}`);
     logger.info(`   Range: ${this.minPrice} - ${this.maxPrice}`);
-    logger.info(`   Update: Every 1 second (1s trading enabled)`);
-    logger.info(`   OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d`);
   }
 
   async loadLastPrice() {
@@ -645,7 +657,6 @@ class AssetSimulator {
     try {
       const now = Date.now();
       
-      // ✅ CHANGED: Update every 1 second for 1s bars
       if (now - this.lastPriceUpdateTime < this.PRICE_UPDATE_INTERVAL) {
         return;
       }
@@ -686,7 +697,6 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
-      // ✅ Write completed bars for ALL timeframes including 1s
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -753,6 +763,7 @@ class AssetSimulator {
     return {
       symbol: this.asset.symbol,
       name: this.asset.name,
+      category: this.asset.category || 'normal',
       currentPrice: this.currentPrice,
       iteration: this.iteration,
       isResumed: this.isResumed,
@@ -778,17 +789,17 @@ class MultiAssetManager {
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (1-SECOND MODE)...');
+    logger.info('🎯 Initializing Multi-Asset Manager (CRYPTO-AWARE MODE)...');
     
     const assets = await this.firebase.getAssets();
     
     if (assets.length === 0) {
-      logger.warn('⚠️ No active assets. Retrying in 30s...');
+      logger.warn('⚠️ No active normal assets. Retrying in 30s...');
       setTimeout(() => this.initialize(), 30000);
       return false;
     }
 
-    logger.info(`📊 Found ${assets.length} active assets`);
+    logger.info(`📊 Found ${assets.length} active normal assets (crypto assets excluded)`);
     
     for (const asset of assets) {
       try {
@@ -801,6 +812,7 @@ class MultiAssetManager {
     }
 
     logger.info(`✅ ${this.simulators.size} simulators initialized`);
+    logger.info(`💎 Crypto assets will be handled by CryptoCompare API`);
     return true;
   }
 
@@ -892,16 +904,17 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v10.0 - 1-SECOND MODE');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v11.0 - CRYPTO-AWARE');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
     logger.info('🚀 ⚡ Update Interval: 1 second');
-    logger.info('🚀 ⚡ Settlement: Backend 1 second');
+    logger.info('🚀 💎 Crypto: CryptoCompare API (real-time)');
+    logger.info('🚀 📊 Normal: Simulated (this service)');
     logger.info('🚀 ================================================');
     logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current: ${TimezoneUtil.formatDateTime()}`);
-    logger.info(`📊 Assets: ${this.simulators.size}`);
+    logger.info(`📊 Normal Assets: ${this.simulators.size}`);
     logger.info('⏱️ Update: 1 second (1s trading)');
     logger.info('🔄 Refresh: 10 minutes');
     logger.info('💾 1s Retention: 2 hours');
@@ -909,10 +922,9 @@ class MultiAssetManager {
     logger.info('🚀 ================================================');
     logger.info('');
 
-    // ✅ UPDATED: 1 second interval
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
-    }, 1000); // ✅ Changed from 2000 to 1000
+    }, 1000);
 
     this.settingsRefreshInterval = setInterval(async () => {
       await this.refreshAssets();
@@ -926,11 +938,10 @@ class MultiAssetManager {
 
     logger.info('✅ All systems running!');
     logger.info('');
-    logger.info('💡 1-Second Trading Active:');
-    logger.info('   • Price updates: Every 1 second');
-    logger.info('   • OHLC 1s bars: Generated every second');
-    logger.info('   • Backend settlement: Every 1 second');
-    logger.info('   • Perfect sync for instant trading');
+    logger.info('💡 Asset Types:');
+    logger.info('   • Normal assets: Simulated by this service');
+    logger.info('   • Crypto assets: Real-time from CryptoCompare API');
+    logger.info('   • Both types support 1-second trading');
     logger.info('');
     logger.info('Press Ctrl+C for graceful shutdown');
     logger.info('');
@@ -939,7 +950,6 @@ class MultiAssetManager {
   logStats() {
     const stats = this.firebase.getStats();
     
-    // Get 1s bar statistics from all simulators
     let total1sBars = 0;
     for (const sim of this.simulators.values()) {
       total1sBars += sim.tfManager.barsCreated['1s'] || 0;
@@ -947,9 +957,9 @@ class MultiAssetManager {
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (1-SECOND MODE)`);
+    logger.info(`📊 STATUS REPORT (CRYPTO-AWARE MODE)`);
     logger.info(`📊 ================================================`);
-    logger.info(`   Simulators: ${this.simulators.size}`);
+    logger.info(`   Normal Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
     logger.info(`   Connection: ${stats.connection.isConnected ? '✅ OK' : '❌ DOWN'}`);
     logger.info(`   Heartbeat: ${stats.connection.lastHeartbeat}`);
@@ -1002,11 +1012,12 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌍 ================================================');
-  console.log('🌍 MULTI-ASSET SIMULATOR v10.0 - 1-SECOND MODE');
+  console.log('🌍 MULTI-ASSET SIMULATOR v11.0 - CRYPTO-AWARE');
   console.log('🌍 ================================================');
   console.log(`🌍 Process TZ: ${process.env.TZ}`);
   console.log(`🌍 Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('🌍 ⚡ 1-SECOND TRADING: ENABLED');
+  console.log('🌍 💎 CRYPTO SUPPORT: ENABLED');
   console.log('🌍 ================================================');
   console.log('');
 
