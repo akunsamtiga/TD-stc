@@ -235,22 +235,52 @@ class FirebaseManager {
       snapshot.forEach(doc => {
         const data = doc.data();
         
-        // ✅ FILTER: Skip crypto assets (they use CryptoCompare API directly)
-        if (data.category === 'crypto') {
-          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (handled by CryptoCompare)`);
-          return; // Skip this asset
+        // ✅ VALIDATION 1: Category must be defined
+        if (!data.category) {
+          logger.warn(`⚠️ Asset ${data.symbol} missing category field, skipping`);
+          return;
         }
         
-        // Only include normal assets that need simulation
-        if (data.dataSource === 'realtime_db' || data.dataSource === 'mock') {
-          assets.push({ 
-            id: doc.id, 
-            ...data 
-          });
+        // ✅ VALIDATION 2: Skip crypto assets explicitly
+        if (data.category === 'crypto') {
+          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (handled by CryptoCompare API)`);
+          return;
         }
+        
+        // ✅ VALIDATION 3: Category must be 'normal' for simulator
+        if (data.category !== 'normal') {
+          logger.warn(`⚠️ Unknown category '${data.category}' for ${data.symbol}, skipping`);
+          return;
+        }
+        
+        // ✅ VALIDATION 4: Check dataSource compatibility
+        if (data.dataSource !== 'realtime_db' && data.dataSource !== 'mock') {
+          logger.warn(`⚠️ Asset ${data.symbol} has unsupported dataSource '${data.dataSource}' for simulator`);
+          return;
+        }
+        
+        // ✅ VALIDATION 5: Ensure simulatorSettings exist for normal assets
+        if (!data.simulatorSettings) {
+          logger.warn(`⚠️ Asset ${data.symbol} missing simulatorSettings, will use defaults`);
+        }
+        
+        // ✅ ALL VALIDATIONS PASSED - Add to simulation list
+        assets.push({ 
+          id: doc.id, 
+          ...data,
+          // ✅ Ensure category is explicitly set
+          category: 'normal'
+        });
       });
 
-      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} normal assets (crypto assets excluded)`);
+      if (assets.length > 0) {
+        logger.info(`📊 Loaded ${assets.length} normal assets for simulation:`);
+        assets.forEach(a => {
+          logger.info(`   • ${a.symbol} (${a.dataSource})`);
+        });
+      }
+
+      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} normal assets (crypto excluded)`);
 
       return assets;
     } catch (error) {
@@ -259,6 +289,7 @@ class FirebaseManager {
       return [];
     }
   }
+
 
   async getLastPrice(path) {
     if (!this.isConnected) {
@@ -419,10 +450,29 @@ class FirebaseManager {
   }
 
   getAssetPath(asset) {
-    if (asset.dataSource === 'realtime_db' && asset.realtimeDbPath) {
-      return asset.realtimeDbPath;
+    // ✅ For realtime_db: use configured path
+    if (asset.dataSource === 'realtime_db') {
+      if (!asset.realtimeDbPath) {
+        logger.warn(`⚠️ Asset ${asset.symbol} has realtime_db source but no path, using default`);
+        return `/${asset.symbol.toLowerCase()}`;
+      }
+      
+      // Ensure path starts with /
+      const path = asset.realtimeDbPath.startsWith('/') 
+        ? asset.realtimeDbPath 
+        : `/${asset.realtimeDbPath}`;
+      
+      return path;
     }
-    return `/mock/${asset.symbol.toLowerCase()}`;
+    
+    // ✅ For mock: use standardized path
+    if (asset.dataSource === 'mock') {
+      return `/mock/${asset.symbol.toLowerCase()}`;
+    }
+    
+    // ✅ Fallback (should never reach here after validation)
+    logger.error(`❌ Invalid dataSource for ${asset.symbol}: ${asset.dataSource}`);
+    return `/error/${asset.symbol.toLowerCase()}`;
   }
 
   getStats() {
