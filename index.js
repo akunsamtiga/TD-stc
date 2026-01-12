@@ -232,64 +232,106 @@ class FirebaseManager {
         .get();
 
       const assets = [];
+      const skippedAssets = {
+        missingCategory: [],
+        cryptoAssets: [],
+        unknownCategory: [],
+        unsupportedDataSource: [],
+        missingPath: [],
+        missingSettings: []
+      };
+
       snapshot.forEach(doc => {
         const data = doc.data();
         
-        // ✅ VALIDATION 1: Category must be defined
         if (!data.category) {
+          skippedAssets.missingCategory.push(data.symbol);
           logger.warn(`⚠️ Asset ${data.symbol} missing category field, skipping`);
           return;
         }
         
-        // ✅ VALIDATION 2: Skip crypto assets explicitly
         if (data.category === 'crypto') {
+          skippedAssets.cryptoAssets.push(data.symbol);
           logger.debug(`💎 Skipping crypto asset: ${data.symbol} (handled by CryptoCompare API)`);
           return;
         }
         
-        // ✅ VALIDATION 3: Category must be 'normal' for simulator
         if (data.category !== 'normal') {
+          skippedAssets.unknownCategory.push({ symbol: data.symbol, category: data.category });
           logger.warn(`⚠️ Unknown category '${data.category}' for ${data.symbol}, skipping`);
           return;
         }
         
-        // ✅ VALIDATION 4: Check dataSource compatibility
         if (data.dataSource !== 'realtime_db' && data.dataSource !== 'mock') {
+          skippedAssets.unsupportedDataSource.push({ symbol: data.symbol, dataSource: data.dataSource });
           logger.warn(`⚠️ Asset ${data.symbol} has unsupported dataSource '${data.dataSource}' for simulator`);
           return;
         }
         
-        // ✅ VALIDATION 5: Ensure simulatorSettings exist for normal assets
+        if (data.dataSource === 'realtime_db' && !data.realtimeDbPath) {
+          skippedAssets.missingPath.push(data.symbol);
+          logger.error(`❌ Asset ${data.symbol} with realtime_db source MUST have realtimeDbPath, skipping`);
+          return;
+        }
+        
         if (!data.simulatorSettings) {
+          skippedAssets.missingSettings.push(data.symbol);
           logger.warn(`⚠️ Asset ${data.symbol} missing simulatorSettings, will use defaults`);
         }
         
-        // ✅ ALL VALIDATIONS PASSED - Add to simulation list
         assets.push({ 
           id: doc.id, 
           ...data,
-          // ✅ Ensure category is explicitly set
           category: 'normal'
         });
       });
 
       if (assets.length > 0) {
+        logger.info('');
         logger.info(`📊 Loaded ${assets.length} normal assets for simulation:`);
         assets.forEach(a => {
-          logger.info(`   • ${a.symbol} (${a.dataSource})`);
+          const pathDisplay = a.dataSource === 'realtime_db' 
+            ? a.realtimeDbPath 
+            : `/mock/${a.symbol.toLowerCase()}`;
+          logger.info(`   • ${a.symbol} (${a.dataSource}) → ${pathDisplay}`);
         });
+        logger.info('');
       }
 
-      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} normal assets (crypto excluded)`);
+      const totalSkipped = Object.values(skippedAssets).reduce((sum, arr) => sum + arr.length, 0);
+      if (totalSkipped > 0) {
+        logger.info('⚠️ Skipped Assets Summary:');
+        if (skippedAssets.cryptoAssets.length > 0) {
+          logger.info(`   💎 Crypto (${skippedAssets.cryptoAssets.length}): ${skippedAssets.cryptoAssets.join(', ')}`);
+        }
+        if (skippedAssets.missingCategory.length > 0) {
+          logger.warn(`   ❌ Missing Category (${skippedAssets.missingCategory.length}): ${skippedAssets.missingCategory.join(', ')}`);
+        }
+        if (skippedAssets.unknownCategory.length > 0) {
+          logger.warn(`   ❌ Unknown Category (${skippedAssets.unknownCategory.length}): ${skippedAssets.unknownCategory.map(a => `${a.symbol}(${a.category})`).join(', ')}`);
+        }
+        if (skippedAssets.unsupportedDataSource.length > 0) {
+          logger.warn(`   ❌ Unsupported DataSource (${skippedAssets.unsupportedDataSource.length}): ${skippedAssets.unsupportedDataSource.map(a => `${a.symbol}(${a.dataSource})`).join(', ')}`);
+        }
+        if (skippedAssets.missingPath.length > 0) {
+          logger.error(`   ❌ Missing Path (${skippedAssets.missingPath.length}): ${skippedAssets.missingPath.join(', ')}`);
+        }
+        if (skippedAssets.missingSettings.length > 0) {
+          logger.warn(`   ⚠️ Missing Settings (${skippedAssets.missingSettings.length}): ${skippedAssets.missingSettings.join(', ')}`);
+        }
+        logger.info('');
+      }
+
+      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} normal assets loaded, ${totalSkipped} skipped`);
 
       return assets;
     } catch (error) {
       logger.error(`❌ Error fetching assets: ${error.message}`);
+      logger.error(error.stack);
       this.consecutiveErrors++;
       return [];
     }
   }
-
 
   async getLastPrice(path) {
     if (!this.isConnected) {
@@ -450,30 +492,50 @@ class FirebaseManager {
   }
 
   getAssetPath(asset) {
-    // ✅ For realtime_db: use configured path
-    if (asset.dataSource === 'realtime_db') {
-      if (!asset.realtimeDbPath) {
-        logger.warn(`⚠️ Asset ${asset.symbol} has realtime_db source but no path, using default`);
-        return `/${asset.symbol.toLowerCase()}`;
-      }
-      
-      // Ensure path starts with /
-      const path = asset.realtimeDbPath.startsWith('/') 
-        ? asset.realtimeDbPath 
-        : `/${asset.realtimeDbPath}`;
-      
-      return path;
+  if (asset.dataSource === 'realtime_db') {
+    if (!asset.realtimeDbPath) {
+      const errorMsg = `CRITICAL: Asset ${asset.symbol} has realtime_db source but missing realtimeDbPath. This should never happen after validation.`;
+      logger.error(`❌ ${errorMsg}`);
+      throw new Error(errorMsg);
     }
     
-    // ✅ For mock: use standardized path
-    if (asset.dataSource === 'mock') {
-      return `/mock/${asset.symbol.toLowerCase()}`;
+    let path = asset.realtimeDbPath.trim();
+    
+    if (!path.startsWith('/')) {
+      logger.warn(`⚠️ Asset ${asset.symbol} path doesn't start with /, fixing: ${path} → /${path}`);
+      path = `/${path}`;
     }
     
-    // ✅ Fallback (should never reach here after validation)
-    logger.error(`❌ Invalid dataSource for ${asset.symbol}: ${asset.dataSource}`);
-    return `/error/${asset.symbol.toLowerCase()}`;
+    if (path.endsWith('/') && path !== '/') {
+      logger.warn(`⚠️ Asset ${asset.symbol} path ends with /, fixing: ${path} → ${path.slice(0, -1)}`);
+      path = path.slice(0, -1);
+    }
+    
+    if (path.includes('//')) {
+      logger.warn(`⚠️ Asset ${asset.symbol} path has double slashes, fixing: ${path}`);
+      path = path.replace(/\/+/g, '/');
+    }
+    
+    const invalidChars = /[^a-zA-Z0-9/_-]/g;
+    if (invalidChars.test(path)) {
+      logger.error(`❌ Asset ${asset.symbol} path contains invalid characters: ${path}`);
+      throw new Error(`Invalid characters in realtimeDbPath for ${asset.symbol}`);
+    }
+    
+    logger.debug(`✅ Asset ${asset.symbol} validated path: ${path}`);
+    return path;
   }
+  
+  if (asset.dataSource === 'mock') {
+    const path = `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+    logger.debug(`✅ Asset ${asset.symbol} mock path: ${path}`);
+    return path;
+  }
+  
+  const errorMsg = `Invalid dataSource for ${asset.symbol}: ${asset.dataSource}. Expected 'realtime_db' or 'mock'.`;
+  logger.error(`❌ ${errorMsg}`);
+  throw new Error(errorMsg);
+}
 
   getStats() {
     const now = Date.now();
