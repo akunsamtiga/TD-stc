@@ -1,5 +1,5 @@
 // trading-simulator/index.js
-// ✅ UPDATED: Skip crypto assets (they use CryptoCompare API directly)
+// ✅ FIXED: Proper crypto asset handling synchronized with backend
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -83,7 +83,7 @@ class FirebaseManager {
     };
     
     this.RETENTION_DAYS = {
-      '1s': 0.0833,  // 2 hours
+      '1s': 0.0833,
       '1m': 2,
       '5m': 2,
       '15m': 3,
@@ -119,7 +119,7 @@ class FirebaseManager {
         throw new Error('Firebase credentials incomplete in .env');
       }
 
-      logger.log('info', '⚡ Initializing Firebase (CRYPTO-AWARE MODE)...');
+      logger.log('info', '⚡ Initializing Firebase (BACKEND-SYNCHRONIZED MODE)...');
 
       if (!admin.apps.length) {
         admin.initializeApp({
@@ -142,11 +142,11 @@ class FirebaseManager {
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.log('info', '✅ Firebase Admin SDK initialized (CRYPTO-AWARE)');
+      logger.log('info', '✅ Firebase Admin SDK initialized (SYNCED WITH BACKEND)');
       logger.log('info', '✅ Firestore ready');
       logger.log('info', '✅ Realtime DB Admin SDK ready');
-      logger.log('info', '💎 Crypto assets will use CryptoCompare API');
-      logger.log('info', '📊 Normal assets will be simulated');
+      logger.log('info', '💎 Crypto assets: Skipped (CryptoCompare API in backend)');
+      logger.log('info', '📊 Normal assets: Simulated here');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -216,7 +216,8 @@ class FirebaseManager {
   }
 
   /**
-   * ✅ UPDATED: Filter out crypto assets (category: 'crypto')
+   * ✅ FIXED: Load only NORMAL assets that need simulation
+   * Crypto assets are handled by backend's CryptoCompare service
    */
   async getAssets() {
     if (!this.isConnected) {
@@ -231,106 +232,176 @@ class FirebaseManager {
         .where('isActive', '==', true)
         .get();
 
-      const assets = [];
+      const normalAssets = [];
       const skippedAssets = {
-        missingCategory: [],
-        cryptoAssets: [],
-        unknownCategory: [],
-        unsupportedDataSource: [],
-        missingPath: [],
-        missingSettings: []
+        cryptoAssets: [],      // Handled by backend CryptoCompare
+        missingCategory: [],    // Invalid: no category
+        invalidDataSource: [],  // Invalid: unsupported source for simulator
+        missingPath: [],        // Invalid: realtime_db without path
+        validationErrors: []    // Other validation issues
       };
 
       snapshot.forEach(doc => {
         const data = doc.data();
         
+        // ============================================
+        // VALIDATION 1: Must have category
+        // ============================================
         if (!data.category) {
           skippedAssets.missingCategory.push(data.symbol);
           logger.warn(`⚠️ Asset ${data.symbol} missing category field, skipping`);
           return;
         }
         
+        // ============================================
+        // VALIDATION 2: Skip crypto (handled by backend)
+        // ============================================
         if (data.category === 'crypto') {
-          skippedAssets.cryptoAssets.push(data.symbol);
-          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (handled by CryptoCompare API)`);
+          skippedAssets.cryptoAssets.push({
+            symbol: data.symbol,
+            dataSource: data.dataSource,
+            path: data.realtimeDbPath || 'auto-generated'
+          });
+          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (backend CryptoCompare handles this)`);
           return;
         }
         
+        // ============================================
+        // VALIDATION 3: Must be 'normal' category
+        // ============================================
         if (data.category !== 'normal') {
-          skippedAssets.unknownCategory.push({ symbol: data.symbol, category: data.category });
+          skippedAssets.validationErrors.push({
+            symbol: data.symbol,
+            issue: `Unknown category: ${data.category}`
+          });
           logger.warn(`⚠️ Unknown category '${data.category}' for ${data.symbol}, skipping`);
           return;
         }
         
-        if (data.dataSource !== 'realtime_db' && data.dataSource !== 'mock') {
-          skippedAssets.unsupportedDataSource.push({ symbol: data.symbol, dataSource: data.dataSource });
-          logger.warn(`⚠️ Asset ${data.symbol} has unsupported dataSource '${data.dataSource}' for simulator`);
+        // ============================================
+        // VALIDATION 4: Normal assets - validate dataSource
+        // ============================================
+        // ✅ FIXED: Accept 'realtime_db', 'mock', 'api' for normal assets
+        const validSources = ['realtime_db', 'mock', 'api'];
+        if (!validSources.includes(data.dataSource)) {
+          skippedAssets.invalidDataSource.push({
+            symbol: data.symbol,
+            dataSource: data.dataSource,
+            expected: validSources.join(', ')
+          });
+          logger.error(`❌ Asset ${data.symbol} has invalid dataSource '${data.dataSource}' for simulator`);
           return;
         }
         
+        // ============================================
+        // VALIDATION 5: realtime_db MUST have path
+        // ============================================
         if (data.dataSource === 'realtime_db' && !data.realtimeDbPath) {
           skippedAssets.missingPath.push(data.symbol);
           logger.error(`❌ Asset ${data.symbol} with realtime_db source MUST have realtimeDbPath, skipping`);
           return;
         }
         
+        // ============================================
+        // VALIDATION 6: Simulator settings (optional)
+        // ============================================
         if (!data.simulatorSettings) {
-          skippedAssets.missingSettings.push(data.symbol);
-          logger.warn(`⚠️ Asset ${data.symbol} missing simulatorSettings, will use defaults`);
+          logger.info(`ℹ️ Asset ${data.symbol} missing simulatorSettings, will use defaults`);
         }
         
-        assets.push({ 
+        // ============================================
+        // ✅ VALID NORMAL ASSET - Add to simulation list
+        // ============================================
+        normalAssets.push({ 
           id: doc.id, 
           ...data,
           category: 'normal'
         });
       });
 
-      if (assets.length > 0) {
+      // ============================================
+      // LOG SUMMARY
+      // ============================================
+      if (normalAssets.length > 0) {
         logger.info('');
-        logger.info(`📊 Loaded ${assets.length} normal assets for simulation:`);
-        assets.forEach(a => {
-          const pathDisplay = a.dataSource === 'realtime_db' 
-            ? a.realtimeDbPath 
-            : `/mock/${a.symbol.toLowerCase()}`;
-          logger.info(`   • ${a.symbol} (${a.dataSource}) → ${pathDisplay}`);
+        logger.info(`📊 ============================================`);
+        logger.info(`📊 LOADED ${normalAssets.length} NORMAL ASSETS FOR SIMULATION`);
+        logger.info(`📊 ============================================`);
+        normalAssets.forEach(a => {
+          const pathDisplay = this.getAssetPathPreview(a);
+          logger.info(`   ✓ ${a.symbol} (${a.dataSource}) → ${pathDisplay}`);
         });
+        logger.info(`📊 ============================================`);
         logger.info('');
       }
 
       const totalSkipped = Object.values(skippedAssets).reduce((sum, arr) => sum + arr.length, 0);
       if (totalSkipped > 0) {
-        logger.info('⚠️ Skipped Assets Summary:');
+        logger.info('');
+        logger.info(`⚠️ ============================================`);
+        logger.info(`⚠️ SKIPPED ${totalSkipped} ASSETS (NOT FOR SIMULATOR)`);
+        logger.info(`⚠️ ============================================`);
+        
         if (skippedAssets.cryptoAssets.length > 0) {
-          logger.info(`   💎 Crypto (${skippedAssets.cryptoAssets.length}): ${skippedAssets.cryptoAssets.join(', ')}`);
+          logger.info(`   💎 Crypto Assets (${skippedAssets.cryptoAssets.length}) - Backend handles:`);
+          skippedAssets.cryptoAssets.forEach(a => {
+            logger.info(`      • ${a.symbol} (${a.dataSource}) → ${a.path}`);
+          });
         }
+        
         if (skippedAssets.missingCategory.length > 0) {
-          logger.warn(`   ❌ Missing Category (${skippedAssets.missingCategory.length}): ${skippedAssets.missingCategory.join(', ')}`);
+          logger.warn(`   ❌ Missing Category (${skippedAssets.missingCategory.length}):`);
+          logger.warn(`      ${skippedAssets.missingCategory.join(', ')}`);
         }
-        if (skippedAssets.unknownCategory.length > 0) {
-          logger.warn(`   ❌ Unknown Category (${skippedAssets.unknownCategory.length}): ${skippedAssets.unknownCategory.map(a => `${a.symbol}(${a.category})`).join(', ')}`);
+        
+        if (skippedAssets.invalidDataSource.length > 0) {
+          logger.error(`   ❌ Invalid DataSource (${skippedAssets.invalidDataSource.length}):`);
+          skippedAssets.invalidDataSource.forEach(a => {
+            logger.error(`      • ${a.symbol}: '${a.dataSource}' (expected: ${a.expected})`);
+          });
         }
-        if (skippedAssets.unsupportedDataSource.length > 0) {
-          logger.warn(`   ❌ Unsupported DataSource (${skippedAssets.unsupportedDataSource.length}): ${skippedAssets.unsupportedDataSource.map(a => `${a.symbol}(${a.dataSource})`).join(', ')}`);
-        }
+        
         if (skippedAssets.missingPath.length > 0) {
-          logger.error(`   ❌ Missing Path (${skippedAssets.missingPath.length}): ${skippedAssets.missingPath.join(', ')}`);
+          logger.error(`   ❌ Missing Path (${skippedAssets.missingPath.length}):`);
+          logger.error(`      ${skippedAssets.missingPath.join(', ')}`);
         }
-        if (skippedAssets.missingSettings.length > 0) {
-          logger.warn(`   ⚠️ Missing Settings (${skippedAssets.missingSettings.length}): ${skippedAssets.missingSettings.join(', ')}`);
+        
+        if (skippedAssets.validationErrors.length > 0) {
+          logger.error(`   ❌ Validation Errors (${skippedAssets.validationErrors.length}):`);
+          skippedAssets.validationErrors.forEach(e => {
+            logger.error(`      • ${e.symbol}: ${e.issue}`);
+          });
         }
+        
+        logger.info(`⚠️ ============================================`);
         logger.info('');
       }
 
-      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${assets.length} normal assets loaded, ${totalSkipped} skipped`);
+      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${normalAssets.length} normal assets, ${totalSkipped} skipped`);
 
-      return assets;
+      return normalAssets;
     } catch (error) {
       logger.error(`❌ Error fetching assets: ${error.message}`);
       logger.error(error.stack);
       this.consecutiveErrors++;
       return [];
     }
+  }
+
+  /**
+   * ✅ NEW: Preview path for logging (doesn't validate)
+   */
+  getAssetPathPreview(asset) {
+    if (asset.dataSource === 'realtime_db') {
+      return asset.realtimeDbPath || '[ERROR: NO PATH]';
+    }
+    if (asset.dataSource === 'mock') {
+      return `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+    }
+    if (asset.dataSource === 'api') {
+      return asset.apiEndpoint || '[API: NO ENDPOINT]';
+    }
+    return '[UNKNOWN SOURCE]';
   }
 
   async getLastPrice(path) {
@@ -411,7 +482,7 @@ class FirebaseManager {
       
       const batch = this.writeQueue.splice(0, 20);
       
-      const results = await Promise.allSettled(
+      await Promise.allSettled(
         batch.map(({ path, data }) => this.setRealtimeValue(path, data, 1))
       );
       
@@ -491,51 +562,83 @@ class FirebaseManager {
     }
   }
 
+  /**
+   * ✅ FIXED: Proper path generation synchronized with backend
+   */
   getAssetPath(asset) {
-  if (asset.dataSource === 'realtime_db') {
-    if (!asset.realtimeDbPath) {
-      const errorMsg = `CRITICAL: Asset ${asset.symbol} has realtime_db source but missing realtimeDbPath. This should never happen after validation.`;
-      logger.error(`❌ ${errorMsg}`);
-      throw new Error(errorMsg);
+    // ============================================
+    // CASE 1: realtime_db source
+    // ============================================
+    if (asset.dataSource === 'realtime_db') {
+      if (!asset.realtimeDbPath) {
+        const errorMsg = `CRITICAL: Asset ${asset.symbol} has realtime_db source but missing realtimeDbPath`;
+        logger.error(`❌ ${errorMsg}`);
+        throw new Error(errorMsg);
+      }
+      
+      let path = asset.realtimeDbPath.trim();
+      
+      // Fix common path issues
+      if (!path.startsWith('/')) {
+        logger.warn(`⚠️ Asset ${asset.symbol} path missing leading /, fixing: ${path} → /${path}`);
+        path = `/${path}`;
+      }
+      
+      if (path.endsWith('/') && path !== '/') {
+        logger.warn(`⚠️ Asset ${asset.symbol} path has trailing /, fixing: ${path}`);
+        path = path.slice(0, -1);
+      }
+      
+      if (path.includes('//')) {
+        logger.warn(`⚠️ Asset ${asset.symbol} path has double slashes, fixing`);
+        path = path.replace(/\/+/g, '/');
+      }
+      
+      // Validate characters
+      const invalidChars = /[^a-zA-Z0-9/_-]/g;
+      if (invalidChars.test(path)) {
+        logger.error(`❌ Asset ${asset.symbol} path contains invalid characters: ${path}`);
+        throw new Error(`Invalid characters in realtimeDbPath for ${asset.symbol}`);
+      }
+      
+      logger.debug(`✅ Asset ${asset.symbol} validated path: ${path}`);
+      return path;
     }
     
-    let path = asset.realtimeDbPath.trim();
-    
-    if (!path.startsWith('/')) {
-      logger.warn(`⚠️ Asset ${asset.symbol} path doesn't start with /, fixing: ${path} → /${path}`);
-      path = `/${path}`;
+    // ============================================
+    // CASE 2: mock source
+    // ============================================
+    if (asset.dataSource === 'mock') {
+      const path = `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      logger.debug(`✅ Asset ${asset.symbol} mock path: ${path}`);
+      return path;
     }
     
-    if (path.endsWith('/') && path !== '/') {
-      logger.warn(`⚠️ Asset ${asset.symbol} path ends with /, fixing: ${path} → ${path.slice(0, -1)}`);
-      path = path.slice(0, -1);
+    // ============================================
+    // CASE 3: api source
+    // ============================================
+    if (asset.dataSource === 'api') {
+      // API source might use external endpoint, but still needs RT DB path for storage
+      if (asset.realtimeDbPath) {
+        let path = asset.realtimeDbPath.trim();
+        if (!path.startsWith('/')) path = `/${path}`;
+        logger.debug(`✅ Asset ${asset.symbol} API with RT DB path: ${path}`);
+        return path;
+      }
+      
+      // Fallback: generate path from symbol
+      const path = `/api/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      logger.debug(`✅ Asset ${asset.symbol} API auto-generated path: ${path}`);
+      return path;
     }
     
-    if (path.includes('//')) {
-      logger.warn(`⚠️ Asset ${asset.symbol} path has double slashes, fixing: ${path}`);
-      path = path.replace(/\/+/g, '/');
-    }
-    
-    const invalidChars = /[^a-zA-Z0-9/_-]/g;
-    if (invalidChars.test(path)) {
-      logger.error(`❌ Asset ${asset.symbol} path contains invalid characters: ${path}`);
-      throw new Error(`Invalid characters in realtimeDbPath for ${asset.symbol}`);
-    }
-    
-    logger.debug(`✅ Asset ${asset.symbol} validated path: ${path}`);
-    return path;
+    // ============================================
+    // INVALID: Should never reach here after validation
+    // ============================================
+    const errorMsg = `Invalid dataSource for ${asset.symbol}: ${asset.dataSource}`;
+    logger.error(`❌ ${errorMsg}`);
+    throw new Error(errorMsg);
   }
-  
-  if (asset.dataSource === 'mock') {
-    const path = `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-    logger.debug(`✅ Asset ${asset.symbol} mock path: ${path}`);
-    return path;
-  }
-  
-  const errorMsg = `Invalid dataSource for ${asset.symbol}: ${asset.dataSource}. Expected 'realtime_db' or 'mock'.`;
-  logger.error(`❌ ${errorMsg}`);
-  throw new Error(errorMsg);
-}
 
   getStats() {
     const now = Date.now();
@@ -709,6 +812,7 @@ class AssetSimulator {
     logger.info(`✅ Simulator initialized: ${asset.symbol}`);
     logger.info(`   Name: ${asset.name}`);
     logger.info(`   Category: ${asset.category || 'normal'}`);
+    logger.info(`   DataSource: ${asset.dataSource}`);
     logger.info(`   Path: ${this.realtimeDbPath}`);
     logger.info(`   Initial: ${this.initialPrice}`);
     logger.info(`   Range: ${this.minPrice} - ${this.maxPrice}`);
@@ -876,6 +980,7 @@ class AssetSimulator {
       symbol: this.asset.symbol,
       name: this.asset.name,
       category: this.asset.category || 'normal',
+      dataSource: this.asset.dataSource,
       currentPrice: this.currentPrice,
       iteration: this.iteration,
       isResumed: this.isResumed,
@@ -901,7 +1006,7 @@ class MultiAssetManager {
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (CRYPTO-AWARE MODE)...');
+    logger.info('🎯 Initializing Multi-Asset Manager (BACKEND-SYNCHRONIZED)...');
     
     const assets = await this.firebase.getAssets();
     
@@ -911,7 +1016,7 @@ class MultiAssetManager {
       return false;
     }
 
-    logger.info(`📊 Found ${assets.length} active normal assets (crypto assets excluded)`);
+    logger.info(`📊 Found ${assets.length} active normal assets (crypto excluded)`);
     
     for (const asset of assets) {
       try {
@@ -924,7 +1029,7 @@ class MultiAssetManager {
     }
 
     logger.info(`✅ ${this.simulators.size} simulators initialized`);
-    logger.info(`💎 Crypto assets will be handled by CryptoCompare API`);
+    logger.info(`💎 Crypto assets: Backend CryptoCompare API`);
     return true;
   }
 
@@ -1016,13 +1121,13 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v11.0 - CRYPTO-AWARE');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v12.0 - BACKEND-SYNCED');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
     logger.info('🚀 ⚡ Update Interval: 1 second');
-    logger.info('🚀 💎 Crypto: CryptoCompare API (real-time)');
-    logger.info('🚀 📊 Normal: Simulated (this service)');
+    logger.info('🚀 💎 Crypto: Backend CryptoCompare (real-time)');
+    logger.info('🚀 📊 Normal: Simulator (this service)');
     logger.info('🚀 ================================================');
     logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current: ${TimezoneUtil.formatDateTime()}`);
@@ -1050,10 +1155,12 @@ class MultiAssetManager {
 
     logger.info('✅ All systems running!');
     logger.info('');
-    logger.info('💡 Asset Types:');
-    logger.info('   • Normal assets: Simulated by this service');
-    logger.info('   • Crypto assets: Real-time from CryptoCompare API');
-    logger.info('   • Both types support 1-second trading');
+    logger.info('💡 Division of Labor:');
+    logger.info('   • Normal assets: Simulated by THIS service');
+    logger.info('   • Crypto assets: Real-time from Backend CryptoCompare');
+    logger.info('   • Both types: Support 1-second trading');
+    logger.info('   • Backend writes OHLC for crypto');
+    logger.info('   • Simulator writes OHLC for normal');
     logger.info('');
     logger.info('Press Ctrl+C for graceful shutdown');
     logger.info('');
@@ -1069,7 +1176,7 @@ class MultiAssetManager {
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (CRYPTO-AWARE MODE)`);
+    logger.info(`📊 STATUS REPORT (BACKEND-SYNCHRONIZED)`);
     logger.info(`📊 ================================================`);
     logger.info(`   Normal Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
@@ -1124,12 +1231,13 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌍 ================================================');
-  console.log('🌍 MULTI-ASSET SIMULATOR v11.0 - CRYPTO-AWARE');
+  console.log('🌍 MULTI-ASSET SIMULATOR v12.0 - BACKEND-SYNCED');
   console.log('🌍 ================================================');
   console.log(`🌍 Process TZ: ${process.env.TZ}`);
   console.log(`🌍 Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('🌍 ⚡ 1-SECOND TRADING: ENABLED');
-  console.log('🌍 💎 CRYPTO SUPPORT: ENABLED');
+  console.log('🌍 💎 CRYPTO: Backend handles (CryptoCompare)');
+  console.log('🌍 📊 NORMAL: This simulator handles');
   console.log('🌍 ================================================');
   console.log('');
 
