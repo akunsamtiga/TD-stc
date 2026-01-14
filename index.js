@@ -1,5 +1,4 @@
-// trading-simulator/index.js
-// Multi-Asset Trading Simulator v12.0 - Binance Synchronized
+// trading-simulator/index.js - FIXED VERSION with Current OHLC Bars
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -812,6 +811,7 @@ class AssetSimulator {
     return newPrice;
   }
 
+  // ✅ FIXED: updatePrice() with Current OHLC Bars
   async updatePrice() {
     try {
       const now = Date.now();
@@ -825,11 +825,13 @@ class AssetSimulator {
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
       
+      // ✅ Get both completed and current bars
       const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, newPrice);
       
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
+      // ✅ Write current price
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -856,6 +858,32 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
+      // ✅ NEW: Write current bars (real-time OHLC)
+      for (const [tf, bar] of Object.entries(currentBars)) {
+        const barDate = new Date(bar.timestamp * 1000);
+        const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
+        
+        const barData = {
+          timestamp: bar.timestamp,
+          datetime: barDateTime.datetime,
+          datetime_iso: barDateTime.datetime_iso,
+          timezone: 'Asia/Jakarta',
+          open: parseFloat(bar.open.toFixed(6)),
+          high: parseFloat(bar.high.toFixed(6)),
+          low: parseFloat(bar.low.toFixed(6)),
+          close: parseFloat(bar.close.toFixed(6)),
+          volume: bar.volume,
+          isCompleted: false // ⭐ Current bar (updating)
+        };
+        
+        // Async write for current bars
+        this.firebase.setRealtimeValueAsync(
+          `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
+          barData
+        );
+      }
+
+      // ✅ Write completed bars (finalized OHLC)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -870,10 +898,11 @@ class AssetSimulator {
           low: parseFloat(bar.low.toFixed(6)),
           close: parseFloat(bar.close.toFixed(6)),
           volume: bar.volume,
-          isCompleted: true
+          isCompleted: true // ⭐ Completed bar (finalized)
         };
         
-        this.firebase.setRealtimeValueAsync(
+        // Critical write for completed bars
+        await this.firebase.setRealtimeValue(
           `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
         );
@@ -1062,11 +1091,12 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v12.0 - BINANCE-SYNCED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v13.0 - BINANCE-SYNCED');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
     logger.info('🚀 ⚡ Update Interval: 1 second');
+    logger.info('🚀 ✅ CURRENT BARS: Writing real-time OHLC');
     logger.info('🚀 💎 Crypto: Backend Binance API (FREE)');
     logger.info('🚀 📊 Normal: This Simulator');
     logger.info('🚀 ================================================');
@@ -1101,7 +1131,7 @@ class MultiAssetManager {
     logger.info('   • Crypto assets: Real-time from Backend Binance API (FREE)');
     logger.info('   • Both types: Support 1-second trading');
     logger.info('   • Backend writes OHLC for crypto (Binance)');
-    logger.info('   • Simulator writes OHLC for normal');
+    logger.info('   • Simulator writes OHLC for normal (CURRENT + COMPLETED)');
     logger.info('');
     logger.info('Press Ctrl+C for graceful shutdown');
     logger.info('');
@@ -1127,6 +1157,7 @@ class MultiAssetManager {
     logger.info('');
     logger.info(`   ⚡ 1s Bars Created: ${total1sBars}`);
     logger.info(`   ⚡ Update Rate: 1 second`);
+    logger.info(`   ✅ Writing: CURRENT + COMPLETED bars`);
     logger.info('');
     logger.info(`   Writes Success: ${stats.writes.success}`);
     logger.info(`   Writes Failed: ${stats.writes.failed}`);
@@ -1172,11 +1203,12 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v12.0 - BINANCE-SYNCED');
+  console.log('🌐 MULTI-ASSET SIMULATOR v13.0 - BINANCE-SYNCED');
   console.log('🌐 ================================================');
   console.log(`🌐 Process TZ: ${process.env.TZ}`);
   console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('🌐 ⚡ 1-SECOND TRADING: ENABLED');
+  console.log('🌐 ✅ CURRENT OHLC BARS: ENABLED');
   console.log('🌐 💎 CRYPTO: Backend Binance API (FREE)');
   console.log('🌐 📊 NORMAL: This Simulator');
   console.log('🌐 ================================================');
