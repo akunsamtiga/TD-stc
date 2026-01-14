@@ -1,5 +1,5 @@
 // trading-simulator/index.js
-// ✅ FIXED: Proper crypto asset handling synchronized with backend
+// Multi-Asset Trading Simulator v12.0 - Binance Synchronized
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -95,14 +95,11 @@ class FirebaseManager {
     
     this.lastCleanupTime = 0;
     this.CLEANUP_INTERVAL = 7200000;
-    
     this.firestoreReadCount = 0;
     this.realtimeWriteCount = 0;
     this.lastReadReset = Date.now();
-    
     this.lastHeartbeat = Date.now();
     this.heartbeatInterval = null;
-    
     this.consecutiveErrors = 0;
     this.MAX_CONSECUTIVE_ERRORS = 5;
   }
@@ -119,7 +116,7 @@ class FirebaseManager {
         throw new Error('Firebase credentials incomplete in .env');
       }
 
-      logger.log('info', '⚡ Initializing Firebase (BACKEND-SYNCHRONIZED MODE)...');
+      logger.log('info', '⚡ Initializing Firebase (BINANCE-SYNCHRONIZED MODE)...');
 
       if (!admin.apps.length) {
         admin.initializeApp({
@@ -142,11 +139,11 @@ class FirebaseManager {
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.log('info', '✅ Firebase Admin SDK initialized (SYNCED WITH BACKEND)');
+      logger.log('info', '✅ Firebase Admin SDK initialized (BINANCE-SYNCED)');
       logger.log('info', '✅ Firestore ready');
       logger.log('info', '✅ Realtime DB Admin SDK ready');
-      logger.log('info', '💎 Crypto assets: Skipped (CryptoCompare API in backend)');
-      logger.log('info', '📊 Normal assets: Simulated here');
+      logger.log('info', '💎 Crypto assets: Handled by backend Binance API (FREE)');
+      logger.log('info', '📊 Normal assets: Simulated by this service');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -215,10 +212,6 @@ class FirebaseManager {
     }, 60000);
   }
 
-  /**
-   * ✅ FIXED: Load only NORMAL assets that need simulation
-   * Crypto assets are handled by backend's CryptoCompare service
-   */
   async getAssets() {
     if (!this.isConnected) {
       logger.warn('⚠️ Firebase not connected, skipping asset fetch');
@@ -234,41 +227,32 @@ class FirebaseManager {
 
       const normalAssets = [];
       const skippedAssets = {
-        cryptoAssets: [],      // Handled by backend CryptoCompare
-        missingCategory: [],    // Invalid: no category
-        invalidDataSource: [],  // Invalid: unsupported source for simulator
-        missingPath: [],        // Invalid: realtime_db without path
-        validationErrors: []    // Other validation issues
+        cryptoAssets: [],
+        missingCategory: [],
+        invalidDataSource: [],
+        missingPath: [],
+        validationErrors: []
       };
 
       snapshot.forEach(doc => {
         const data = doc.data();
         
-        // ============================================
-        // VALIDATION 1: Must have category
-        // ============================================
         if (!data.category) {
           skippedAssets.missingCategory.push(data.symbol);
           logger.warn(`⚠️ Asset ${data.symbol} missing category field, skipping`);
           return;
         }
         
-        // ============================================
-        // VALIDATION 2: Skip crypto (handled by backend)
-        // ============================================
         if (data.category === 'crypto') {
           skippedAssets.cryptoAssets.push({
             symbol: data.symbol,
             dataSource: data.dataSource,
             path: data.realtimeDbPath || 'auto-generated'
           });
-          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (backend CryptoCompare handles this)`);
+          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (backend Binance handles this)`);
           return;
         }
         
-        // ============================================
-        // VALIDATION 3: Must be 'normal' category
-        // ============================================
         if (data.category !== 'normal') {
           skippedAssets.validationErrors.push({
             symbol: data.symbol,
@@ -278,10 +262,6 @@ class FirebaseManager {
           return;
         }
         
-        // ============================================
-        // VALIDATION 4: Normal assets - validate dataSource
-        // ============================================
-        // ✅ FIXED: Accept 'realtime_db', 'mock', 'api' for normal assets
         const validSources = ['realtime_db', 'mock', 'api'];
         if (!validSources.includes(data.dataSource)) {
           skippedAssets.invalidDataSource.push({
@@ -293,25 +273,16 @@ class FirebaseManager {
           return;
         }
         
-        // ============================================
-        // VALIDATION 5: realtime_db MUST have path
-        // ============================================
         if (data.dataSource === 'realtime_db' && !data.realtimeDbPath) {
           skippedAssets.missingPath.push(data.symbol);
           logger.error(`❌ Asset ${data.symbol} with realtime_db source MUST have realtimeDbPath, skipping`);
           return;
         }
         
-        // ============================================
-        // VALIDATION 6: Simulator settings (optional)
-        // ============================================
         if (!data.simulatorSettings) {
           logger.info(`ℹ️ Asset ${data.symbol} missing simulatorSettings, will use defaults`);
         }
         
-        // ============================================
-        // ✅ VALID NORMAL ASSET - Add to simulation list
-        // ============================================
         normalAssets.push({ 
           id: doc.id, 
           ...data,
@@ -319,9 +290,6 @@ class FirebaseManager {
         });
       });
 
-      // ============================================
-      // LOG SUMMARY
-      // ============================================
       if (normalAssets.length > 0) {
         logger.info('');
         logger.info(`📊 ============================================`);
@@ -343,7 +311,7 @@ class FirebaseManager {
         logger.info(`⚠️ ============================================`);
         
         if (skippedAssets.cryptoAssets.length > 0) {
-          logger.info(`   💎 Crypto Assets (${skippedAssets.cryptoAssets.length}) - Backend handles:`);
+          logger.info(`   💎 Crypto Assets (${skippedAssets.cryptoAssets.length}) - Backend Binance handles:`);
           skippedAssets.cryptoAssets.forEach(a => {
             logger.info(`      • ${a.symbol} (${a.dataSource}) → ${a.path}`);
           });
@@ -388,9 +356,6 @@ class FirebaseManager {
     }
   }
 
-  /**
-   * ✅ NEW: Preview path for logging (doesn't validate)
-   */
   getAssetPathPreview(asset) {
     if (asset.dataSource === 'realtime_db') {
       return asset.realtimeDbPath || '[ERROR: NO PATH]';
@@ -562,13 +527,7 @@ class FirebaseManager {
     }
   }
 
-  /**
-   * ✅ FIXED: Proper path generation synchronized with backend
-   */
   getAssetPath(asset) {
-    // ============================================
-    // CASE 1: realtime_db source
-    // ============================================
     if (asset.dataSource === 'realtime_db') {
       if (!asset.realtimeDbPath) {
         const errorMsg = `CRITICAL: Asset ${asset.symbol} has realtime_db source but missing realtimeDbPath`;
@@ -578,7 +537,6 @@ class FirebaseManager {
       
       let path = asset.realtimeDbPath.trim();
       
-      // Fix common path issues
       if (!path.startsWith('/')) {
         logger.warn(`⚠️ Asset ${asset.symbol} path missing leading /, fixing: ${path} → /${path}`);
         path = `/${path}`;
@@ -594,7 +552,6 @@ class FirebaseManager {
         path = path.replace(/\/+/g, '/');
       }
       
-      // Validate characters
       const invalidChars = /[^a-zA-Z0-9/_-]/g;
       if (invalidChars.test(path)) {
         logger.error(`❌ Asset ${asset.symbol} path contains invalid characters: ${path}`);
@@ -605,20 +562,13 @@ class FirebaseManager {
       return path;
     }
     
-    // ============================================
-    // CASE 2: mock source
-    // ============================================
     if (asset.dataSource === 'mock') {
       const path = `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
       logger.debug(`✅ Asset ${asset.symbol} mock path: ${path}`);
       return path;
     }
     
-    // ============================================
-    // CASE 3: api source
-    // ============================================
     if (asset.dataSource === 'api') {
-      // API source might use external endpoint, but still needs RT DB path for storage
       if (asset.realtimeDbPath) {
         let path = asset.realtimeDbPath.trim();
         if (!path.startsWith('/')) path = `/${path}`;
@@ -626,15 +576,11 @@ class FirebaseManager {
         return path;
       }
       
-      // Fallback: generate path from symbol
       const path = `/api/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
       logger.debug(`✅ Asset ${asset.symbol} API auto-generated path: ${path}`);
       return path;
     }
     
-    // ============================================
-    // INVALID: Should never reach here after validation
-    // ============================================
     const errorMsg = `Invalid dataSource for ${asset.symbol}: ${asset.dataSource}`;
     logger.error(`❌ ${errorMsg}`);
     throw new Error(errorMsg);
@@ -799,13 +745,10 @@ class AssetSimulator {
     this.lastLogTime = 0;
     this.isResumed = false;
     this.lastPriceData = null;
-    
     this.consecutiveErrors = 0;
     this.MAX_ERRORS = 5;
-    
     this.lastPriceUpdateTime = 0;
     this.PRICE_UPDATE_INTERVAL = 1000;
-
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
     logger.info('');
@@ -969,7 +912,6 @@ class AssetSimulator {
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     this.minPrice = settings.minPrice || this.minPrice;
     this.maxPrice = settings.maxPrice || this.maxPrice;
-
     this.asset = newAsset;
     
     logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
@@ -1001,12 +943,11 @@ class MultiAssetManager {
     this.healthCheckInterval = null;
     this.isRunning = false;
     this.isPaused = false;
-    
     this.isShuttingDown = false;
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (BACKEND-SYNCHRONIZED)...');
+    logger.info('🎯 Initializing Multi-Asset Manager (BINANCE-SYNCHRONIZED)...');
     
     const assets = await this.firebase.getAssets();
     
@@ -1029,7 +970,7 @@ class MultiAssetManager {
     }
 
     logger.info(`✅ ${this.simulators.size} simulators initialized`);
-    logger.info(`💎 Crypto assets: Backend CryptoCompare API`);
+    logger.info(`💎 Crypto assets: Backend Binance API (FREE)`);
     return true;
   }
 
@@ -1121,15 +1062,15 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v12.0 - BACKEND-SYNCED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v12.0 - BINANCE-SYNCED');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
     logger.info('🚀 ⚡ Update Interval: 1 second');
-    logger.info('🚀 💎 Crypto: Backend CryptoCompare (real-time)');
-    logger.info('🚀 📊 Normal: Simulator (this service)');
+    logger.info('🚀 💎 Crypto: Backend Binance API (FREE)');
+    logger.info('🚀 📊 Normal: This Simulator');
     logger.info('🚀 ================================================');
-    logger.info(`🌍 Timezone: Asia/Jakarta (WIB = UTC+7)`);
+    logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`⏰ Current: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`📊 Normal Assets: ${this.simulators.size}`);
     logger.info('⏱️ Update: 1 second (1s trading)');
@@ -1157,9 +1098,9 @@ class MultiAssetManager {
     logger.info('');
     logger.info('💡 Division of Labor:');
     logger.info('   • Normal assets: Simulated by THIS service');
-    logger.info('   • Crypto assets: Real-time from Backend CryptoCompare');
+    logger.info('   • Crypto assets: Real-time from Backend Binance API (FREE)');
     logger.info('   • Both types: Support 1-second trading');
-    logger.info('   • Backend writes OHLC for crypto');
+    logger.info('   • Backend writes OHLC for crypto (Binance)');
     logger.info('   • Simulator writes OHLC for normal');
     logger.info('');
     logger.info('Press Ctrl+C for graceful shutdown');
@@ -1176,7 +1117,7 @@ class MultiAssetManager {
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (BACKEND-SYNCHRONIZED)`);
+    logger.info(`📊 STATUS REPORT (BINANCE-SYNCHRONIZED)`);
     logger.info(`📊 ================================================`);
     logger.info(`   Normal Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
@@ -1230,15 +1171,15 @@ class MultiAssetManager {
 
 async function main() {
   console.log('');
-  console.log('🌍 ================================================');
-  console.log('🌍 MULTI-ASSET SIMULATOR v12.0 - BACKEND-SYNCED');
-  console.log('🌍 ================================================');
-  console.log(`🌍 Process TZ: ${process.env.TZ}`);
-  console.log(`🌍 Current Time: ${TimezoneUtil.formatDateTime()}`);
-  console.log('🌍 ⚡ 1-SECOND TRADING: ENABLED');
-  console.log('🌍 💎 CRYPTO: Backend handles (CryptoCompare)');
-  console.log('🌍 📊 NORMAL: This simulator handles');
-  console.log('🌍 ================================================');
+  console.log('🌐 ================================================');
+  console.log('🌐 MULTI-ASSET SIMULATOR v12.0 - BINANCE-SYNCED');
+  console.log('🌐 ================================================');
+  console.log(`🌐 Process TZ: ${process.env.TZ}`);
+  console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
+  console.log('🌐 ⚡ 1-SECOND TRADING: ENABLED');
+  console.log('🌐 💎 CRYPTO: Backend Binance API (FREE)');
+  console.log('🌐 📊 NORMAL: This Simulator');
+  console.log('🌐 ================================================');
   console.log('');
 
   const firebaseManager = new FirebaseManager();
