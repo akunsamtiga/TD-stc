@@ -99,6 +99,68 @@ async function getPathSize(db, path) {
   }
 }
 
+async function deletePathRecursive(db, path, maxDepth = 5) {
+  try {
+    // Try direct delete first
+    try {
+      await db.ref(path).remove();
+      return { success: true, method: 'direct' };
+    } catch (error) {
+      if (!error.message.includes('WRITE_TOO_BIG')) {
+        throw error;
+      }
+    }
+
+    // If too big, delete children recursively
+    log(`   ⚠️  ${path} too large, deleting children...`, 'yellow');
+    
+    const snapshot = await db.ref(path).once('value');
+    const data = snapshot.val();
+    
+    if (!data || typeof data !== 'object') {
+      return { success: true, method: 'empty' };
+    }
+
+    const children = Object.keys(data);
+    log(`   📊 Found ${children.length} children in ${path}`, 'blue');
+    
+    let deletedCount = 0;
+    const batchSize = 50;
+    
+    for (let i = 0; i < children.length; i += batchSize) {
+      const batch = children.slice(i, i + batchSize);
+      
+      await Promise.all(
+        batch.map(async (childKey) => {
+          const childPath = `${path}/${childKey}`;
+          
+          if (maxDepth > 0) {
+            await deletePathRecursive(db, childPath, maxDepth - 1);
+          } else {
+            await db.ref(childPath).remove();
+          }
+          
+          deletedCount++;
+        })
+      );
+      
+      log(`   ⏳ Progress: ${deletedCount}/${children.length} children deleted`, 'cyan');
+      
+      // Small delay between batches
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    
+    // Delete the parent after all children are gone
+    await db.ref(path).remove();
+    
+    return { success: true, method: 'recursive', deletedCount };
+    
+  } catch (error) {
+    log(`   ❌ Error deleting ${path}: ${error.message}`, 'red');
+    return { success: false, error: error.message };
+  }
+}
+
 async function deleteAll(db) {
   const confirm = await question(
     `${colors.red}${colors.bold}⚠️  DELETE ALL DATA? This cannot be undone! Type 'DELETE ALL' to confirm: ${colors.reset}`
@@ -110,12 +172,66 @@ async function deleteAll(db) {
   }
 
   try {
-    log('\n🗑️  Deleting all data...', 'yellow');
-    await db.ref('/').remove();
-    log('✅ All data deleted successfully', 'green');
-    return true;
+    log('\n📂 Fetching all paths to delete...', 'cyan');
+    
+    // 1. Get all top-level paths
+    const snapshot = await db.ref('/').once('value');
+    const data = snapshot.val();
+    
+    if (!data) {
+      log('🔭 Database is already empty', 'yellow');
+      return true;
+    }
+
+    const paths = Object.keys(data).map(key => `/${key}`);
+    
+    log(`\n🗑️  Found ${paths.length} paths to delete:`, 'yellow');
+    paths.forEach(path => log(`   • ${path}`, 'blue'));
+    
+    // 2. Delete each path (with recursive support for large paths)
+    log('\n⏳ Deleting paths (large paths will be deleted recursively)...', 'yellow');
+    let successCount = 0;
+    let failCount = 0;
+    
+    for (const path of paths) {
+      try {
+        log(`\n🗑️  Deleting ${path}...`, 'cyan');
+        
+        const result = await deletePathRecursive(db, path);
+        
+        if (result.success) {
+          if (result.method === 'recursive') {
+            log(`   ✅ Deleted ${path} recursively (${result.deletedCount} children)`, 'green');
+          } else {
+            log(`   ✅ Deleted ${path}`, 'green');
+          }
+          successCount++;
+        } else {
+          log(`   ❌ Failed to delete ${path}: ${result.error}`, 'red');
+          failCount++;
+        }
+        
+        // Small delay between paths
+        await new Promise(resolve => setTimeout(resolve, 300));
+        
+      } catch (error) {
+        log(`   ❌ Failed to delete ${path}: ${error.message}`, 'red');
+        failCount++;
+      }
+    }
+
+    // 3. Summary
+    log('\n' + '━'.repeat(50), 'cyan');
+    log(`✅ Successfully deleted ${successCount} paths`, 'green');
+    if (failCount > 0) {
+      log(`❌ Failed to delete ${failCount} paths`, 'red');
+    }
+    log('━'.repeat(50), 'cyan');
+    
+    return failCount === 0;
+
   } catch (error) {
-    log(`❌ Error deleting all data: ${error.message}`, 'red');
+    log(`\n❌ Error during deletion: ${error.message}`, 'red');
     return false;
   }
 }
