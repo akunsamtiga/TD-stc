@@ -1,4 +1,4 @@
-// trading-simulator/index.js - FIXED VERSION with Current OHLC Bars
+// trading-simulator/index.js - FIXED: Correct Settings Reading
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -730,14 +730,30 @@ class AssetSimulator {
     this.firebase = firebaseManager;
     this.tfManager = new TimeframeManager();
 
+    // ✅ FIXED: Correct settings reading with proper fallbacks
     const settings = asset.simulatorSettings || {};
     
+    // Read initialPrice
     this.initialPrice = settings.initialPrice || 40.022;
+    
+    // ✅ CRITICAL FIX: Read minPrice/maxPrice correctly
+    // BEFORE: this.minPrice = settings.minPrice || (this.initialPrice * 0.5);
+    // AFTER: Check if settings.minPrice exists explicitly
+    if (settings.minPrice !== undefined && settings.minPrice !== null) {
+      this.minPrice = settings.minPrice;
+    } else {
+      this.minPrice = this.initialPrice * 0.5;
+    }
+    
+    if (settings.maxPrice !== undefined && settings.maxPrice !== null) {
+      this.maxPrice = settings.maxPrice;
+    } else {
+      this.maxPrice = this.initialPrice * 2.0;
+    }
+    
     this.currentPrice = this.initialPrice;
     this.volatilityMin = settings.secondVolatilityMin || 0.00001;
     this.volatilityMax = settings.secondVolatilityMax || 0.00008;
-    this.minPrice = settings.minPrice || (this.initialPrice * 0.5);
-    this.maxPrice = settings.maxPrice || (this.initialPrice * 2.0);
     
     this.lastDirection = 1;
     this.iteration = 0;
@@ -750,14 +766,19 @@ class AssetSimulator {
     this.PRICE_UPDATE_INTERVAL = 1000;
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
+    // ✅ LOG SETTINGS TO VERIFY
     logger.info('');
     logger.info(`✅ Simulator initialized: ${asset.symbol}`);
     logger.info(`   Name: ${asset.name}`);
     logger.info(`   Category: ${asset.category || 'normal'}`);
     logger.info(`   DataSource: ${asset.dataSource}`);
     logger.info(`   Path: ${this.realtimeDbPath}`);
-    logger.info(`   Initial: ${this.initialPrice}`);
-    logger.info(`   Range: ${this.minPrice} - ${this.maxPrice}`);
+    logger.info(`   📊 SETTINGS:`);
+    logger.info(`      Initial Price: ${this.initialPrice}`);
+    logger.info(`      Min Price: ${this.minPrice} ${settings.minPrice !== undefined ? '✓' : '(default)'}`);
+    logger.info(`      Max Price: ${this.maxPrice} ${settings.maxPrice !== undefined ? '✓' : '(default)'}`);
+    logger.info(`      Range Width: ${(this.maxPrice - this.minPrice).toFixed(2)}`);
+    logger.info(`      Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
   }
 
   async loadLastPrice() {
@@ -769,13 +790,16 @@ class AssetSimulator {
       if (lastPriceData && lastPriceData.price) {
         const price = lastPriceData.price;
         
+        // ✅ Check if price is within configured range
         if (price >= this.minPrice && price <= this.maxPrice) {
           this.currentPrice = price;
           this.lastPriceData = lastPriceData;
           this.isResumed = true;
           
-          logger.info(`🔄 [${this.asset.symbol}] RESUMED: ${price.toFixed(6)}`);
+          logger.info(`🔄 [${this.asset.symbol}] RESUMED: ${price.toFixed(6)} (within ${this.minPrice}-${this.maxPrice})`);
           return true;
+        } else {
+          logger.warn(`⚠️ [${this.asset.symbol}] Last price ${price} outside range ${this.minPrice}-${this.maxPrice}, resetting to initial`);
         }
       }
       
@@ -799,19 +823,21 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
+    // ✅ ENFORCE PRICE BOUNDARIES
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice;
-      this.lastDirection = 1;
+      this.lastDirection = 1; // Force upward movement
+      logger.debug(`[${this.asset.symbol}] Hit min price ${this.minPrice}, bouncing up`);
     }
     if (newPrice > this.maxPrice) {
       newPrice = this.maxPrice;
-      this.lastDirection = -1;
+      this.lastDirection = -1; // Force downward movement
+      logger.debug(`[${this.asset.symbol}] Hit max price ${this.maxPrice}, bouncing down`);
     }
     
     return newPrice;
   }
 
-  // ✅ FIXED: updatePrice() with Current OHLC Bars
   async updatePrice() {
     try {
       const now = Date.now();
@@ -825,13 +851,11 @@ class AssetSimulator {
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
       
-      // ✅ Get both completed and current bars
       const { completedBars, currentBars } = this.tfManager.updateOHLC(timestamp, newPrice);
       
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ Write current price
       const currentPriceData = {
         price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
@@ -858,7 +882,7 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
-      // ✅ NEW: Write current bars (real-time OHLC)
+      // Write current bars (real-time OHLC)
       for (const [tf, bar] of Object.entries(currentBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -873,17 +897,16 @@ class AssetSimulator {
           low: parseFloat(bar.low.toFixed(6)),
           close: parseFloat(bar.close.toFixed(6)),
           volume: bar.volume,
-          isCompleted: false // ⭐ Current bar (updating)
+          isCompleted: false
         };
         
-        // Async write for current bars
         this.firebase.setRealtimeValueAsync(
           `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
         );
       }
 
-      // ✅ Write completed bars (finalized OHLC)
+      // Write completed bars (finalized OHLC)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -898,10 +921,9 @@ class AssetSimulator {
           low: parseFloat(bar.low.toFixed(6)),
           close: parseFloat(bar.close.toFixed(6)),
           volume: bar.volume,
-          isCompleted: true // ⭐ Completed bar (finalized)
+          isCompleted: true
         };
         
-        // Critical write for completed bars
         await this.firebase.setRealtimeValue(
           `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
@@ -911,12 +933,14 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
+      // Enhanced logging with range info
       if (now - this.lastLogTime > 30000) {
         const bars1s = this.tfManager.barsCreated['1s'] || 0;
+        const pricePosition = ((newPrice - this.minPrice) / (this.maxPrice - this.minPrice) * 100).toFixed(1);
         logger.info(
           `[${this.asset.symbol}] ${this.isResumed ? '🔄' : '🆕'} | ` +
           `#${this.iteration}: ${newPrice.toFixed(6)} ` +
-          `(${((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)}%) | ` +
+          `(${pricePosition}% in range ${this.minPrice}-${this.maxPrice}) | ` +
           `1s bars: ${bars1s}`
         );
         this.lastLogTime = now;
@@ -937,13 +961,20 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
+    // ✅ Update settings with proper checking
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
-    this.minPrice = settings.minPrice || this.minPrice;
-    this.maxPrice = settings.maxPrice || this.maxPrice;
+    
+    if (settings.minPrice !== undefined && settings.minPrice !== null) {
+      this.minPrice = settings.minPrice;
+    }
+    if (settings.maxPrice !== undefined && settings.maxPrice !== null) {
+      this.maxPrice = settings.maxPrice;
+    }
+    
     this.asset = newAsset;
     
-    logger.info(`🔄 [${this.asset.symbol}] Settings updated`);
+    logger.info(`🔄 [${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice}`);
   }
 
   getInfo() {
@@ -953,6 +984,9 @@ class AssetSimulator {
       category: this.asset.category || 'normal',
       dataSource: this.asset.dataSource,
       currentPrice: this.currentPrice,
+      minPrice: this.minPrice,
+      maxPrice: this.maxPrice,
+      priceRange: this.maxPrice - this.minPrice,
       iteration: this.iteration,
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
@@ -1091,12 +1125,12 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v13.0 - BINANCE-SYNCED');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v14.0 - FIXED SETTINGS');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
     logger.info('🚀 ⚡ Update Interval: 1 second');
-    logger.info('🚀 ✅ CURRENT BARS: Writing real-time OHLC');
+    logger.info('🚀 ✅ PRICE RANGE: Correctly enforced from settings');
     logger.info('🚀 💎 Crypto: Backend Binance API (FREE)');
     logger.info('🚀 📊 Normal: This Simulator');
     logger.info('🚀 ================================================');
@@ -1141,13 +1175,21 @@ class MultiAssetManager {
     const stats = this.firebase.getStats();
     
     let total1sBars = 0;
+    const assetInfo = [];
+    
     for (const sim of this.simulators.values()) {
       total1sBars += sim.tfManager.barsCreated['1s'] || 0;
+      assetInfo.push({
+        symbol: sim.asset.symbol,
+        price: sim.currentPrice.toFixed(6),
+        range: `${sim.minPrice}-${sim.maxPrice}`,
+        position: ((sim.currentPrice - sim.minPrice) / (sim.maxPrice - sim.minPrice) * 100).toFixed(1)
+      });
     }
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (BINANCE-SYNCHRONIZED)`);
+    logger.info(`📊 STATUS REPORT (SETTINGS FIXED)`);
     logger.info(`📊 ================================================`);
     logger.info(`   Normal Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
@@ -1157,8 +1199,16 @@ class MultiAssetManager {
     logger.info('');
     logger.info(`   ⚡ 1s Bars Created: ${total1sBars}`);
     logger.info(`   ⚡ Update Rate: 1 second`);
-    logger.info(`   ✅ Writing: CURRENT + COMPLETED bars`);
     logger.info('');
+    
+    if (assetInfo.length > 0) {
+      logger.info(`   📈 Asset Prices:`);
+      assetInfo.forEach(a => {
+        logger.info(`      ${a.symbol}: ${a.price} (${a.position}% in ${a.range})`);
+      });
+      logger.info('');
+    }
+    
     logger.info(`   Writes Success: ${stats.writes.success}`);
     logger.info(`   Writes Failed: ${stats.writes.failed}`);
     logger.info(`   Success Rate: ${stats.writes.successRate}%`);
@@ -1203,12 +1253,12 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v13.0 - BINANCE-SYNCED');
+  console.log('🌐 MULTI-ASSET SIMULATOR v14.0 - SETTINGS FIXED');
   console.log('🌐 ================================================');
   console.log(`🌐 Process TZ: ${process.env.TZ}`);
   console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('🌐 ⚡ 1-SECOND TRADING: ENABLED');
-  console.log('🌐 ✅ CURRENT OHLC BARS: ENABLED');
+  console.log('🌐 ✅ PRICE RANGE: Correctly read from Firestore');
   console.log('🌐 💎 CRYPTO: Backend Binance API (FREE)');
   console.log('🌐 📊 NORMAL: This Simulator');
   console.log('🌐 ================================================');
