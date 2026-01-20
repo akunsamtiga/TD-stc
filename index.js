@@ -1,4 +1,4 @@
-// trading-simulator/index.js - FIXED: Correct Settings Reading
+// trading-simulator/index.js - NO AUTO-RETRY VERSION
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -730,15 +730,10 @@ class AssetSimulator {
     this.firebase = firebaseManager;
     this.tfManager = new TimeframeManager();
 
-    // ✅ FIXED: Correct settings reading with proper fallbacks
     const settings = asset.simulatorSettings || {};
     
-    // Read initialPrice
     this.initialPrice = settings.initialPrice || 40.022;
     
-    // ✅ CRITICAL FIX: Read minPrice/maxPrice correctly
-    // BEFORE: this.minPrice = settings.minPrice || (this.initialPrice * 0.5);
-    // AFTER: Check if settings.minPrice exists explicitly
     if (settings.minPrice !== undefined && settings.minPrice !== null) {
       this.minPrice = settings.minPrice;
     } else {
@@ -766,7 +761,6 @@ class AssetSimulator {
     this.PRICE_UPDATE_INTERVAL = 1000;
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
-    // ✅ LOG SETTINGS TO VERIFY
     logger.info('');
     logger.info(`✅ Simulator initialized: ${asset.symbol}`);
     logger.info(`   Name: ${asset.name}`);
@@ -790,7 +784,6 @@ class AssetSimulator {
       if (lastPriceData && lastPriceData.price) {
         const price = lastPriceData.price;
         
-        // ✅ Check if price is within configured range
         if (price >= this.minPrice && price <= this.maxPrice) {
           this.currentPrice = price;
           this.lastPriceData = lastPriceData;
@@ -823,15 +816,14 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // ✅ ENFORCE PRICE BOUNDARIES
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice;
-      this.lastDirection = 1; // Force upward movement
+      this.lastDirection = 1;
       logger.debug(`[${this.asset.symbol}] Hit min price ${this.minPrice}, bouncing up`);
     }
     if (newPrice > this.maxPrice) {
       newPrice = this.maxPrice;
-      this.lastDirection = -1; // Force downward movement
+      this.lastDirection = -1;
       logger.debug(`[${this.asset.symbol}] Hit max price ${this.maxPrice}, bouncing down`);
     }
     
@@ -882,7 +874,6 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
-      // Write current bars (real-time OHLC)
       for (const [tf, bar] of Object.entries(currentBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -906,7 +897,6 @@ class AssetSimulator {
         );
       }
 
-      // Write completed bars (finalized OHLC)
       for (const [tf, bar] of Object.entries(completedBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -933,7 +923,6 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
-      // Enhanced logging with range info
       if (now - this.lastLogTime > 30000) {
         const bars1s = this.tfManager.barsCreated['1s'] || 0;
         const pricePosition = ((newPrice - this.minPrice) / (this.maxPrice - this.minPrice) * 100).toFixed(1);
@@ -961,7 +950,6 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
-    // ✅ Update settings with proper checking
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     
@@ -1015,8 +1003,12 @@ class MultiAssetManager {
     const assets = await this.firebase.getAssets();
     
     if (assets.length === 0) {
-      logger.warn('⚠️ No active normal assets. Retrying in 30s...');
-      setTimeout(() => this.initialize(), 30000);
+      logger.error('❌ NO ACTIVE NORMAL ASSETS FOUND. Simulator shutting down (no auto-retry).');
+      logger.error('💡 To start simulator, add normal assets with category: "normal" and isActive: true');
+      logger.error('   Example dataSource: realtime_db, mock, or api');
+      
+      await this.stop();
+      setTimeout(() => process.exit(0), 1000);
       return false;
     }
 
@@ -1116,8 +1108,9 @@ class MultiAssetManager {
     const initialized = await this.initialize();
     
     if (!initialized || this.simulators.size === 0) {
-      logger.warn('⚠️ No simulators started. Retrying in 30s...');
-      setTimeout(() => this.start(), 30000);
+      logger.error('❌ Failed to start simulators. Exiting (no auto-retry).');
+      await this.stop();
+      setTimeout(() => process.exit(1), 1000);
       return;
     }
 
@@ -1125,7 +1118,7 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v14.0 - FIXED SETTINGS');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v14.0 - NO AUTO-RETRY');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
@@ -1142,7 +1135,6 @@ class MultiAssetManager {
     logger.info('💾 1s Retention: 2 hours');
     logger.info('🗑️ Cleanup: Every 2 hours');
     logger.info('🚀 ================================================');
-    logger.info('');
 
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
@@ -1167,7 +1159,8 @@ class MultiAssetManager {
     logger.info('   • Backend writes OHLC for crypto (Binance)');
     logger.info('   • Simulator writes OHLC for normal (CURRENT + COMPLETED)');
     logger.info('');
-    logger.info('Press Ctrl+C for graceful shutdown');
+    logger.info('⚠️  NO AUTO-RETRY: If no assets, simulator will EXIT');
+    logger.info('   To restart, add assets to Firestore then run: npm start');
     logger.info('');
   }
 
@@ -1189,7 +1182,7 @@ class MultiAssetManager {
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (SETTINGS FIXED)`);
+    logger.info(`📊 STATUS REPORT (NO AUTO-RETRY MODE)`);
     logger.info(`📊 ================================================`);
     logger.info(`   Normal Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
@@ -1253,7 +1246,7 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v14.0 - SETTINGS FIXED');
+  console.log('🌐 MULTI-ASSET SIMULATOR v14.0 - NO AUTO-RETRY');
   console.log('🌐 ================================================');
   console.log(`🌐 Process TZ: ${process.env.TZ}`);
   console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
@@ -1261,6 +1254,7 @@ async function main() {
   console.log('🌐 ✅ PRICE RANGE: Correctly read from Firestore');
   console.log('🌐 💎 CRYPTO: Backend Binance API (FREE)');
   console.log('🌐 📊 NORMAL: This Simulator');
+  console.log('🌐 ❌ NO AUTO-RETRY: Will EXIT if no assets');
   console.log('🌐 ================================================');
   console.log('');
 
