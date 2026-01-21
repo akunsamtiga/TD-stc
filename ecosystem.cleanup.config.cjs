@@ -10,7 +10,7 @@
 module.exports = {
   apps: [{
     name: 'db-cleanup',
-    script: './cleanup.js',
+    script: './cleanup-all-auto.js',
     
     // Execution mode
     instances: 1,
