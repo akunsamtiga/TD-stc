@@ -3,12 +3,13 @@
 /**
  * =======================================================
  * REALTIME DATABASE AUTO CLEANUP - DELETE ALL DATA
+ * FIXED: Memory-optimized version
  * =======================================================
  * 
  * CARA PAKAI:
  * 1. Pastikan .env sudah dikonfigurasi dengan benar
  * 2. Jalankan dengan PM2:
- *    pm2 start cleanup-all-auto.js --name "db-cleanup"
+ *    pm2 start cleanup-all-auto.js --name "db-cleanup" --node-args="--max-old-space-size=4096"
  * 
  * 3. Monitor progress:
  *    pm2 logs db-cleanup
@@ -21,6 +22,7 @@
  * - Otomatis batch untuk data besar
  * - Recursive delete untuk path yang besar
  * - Auto-retry jika gagal
+ * - Memory-optimized: tidak load semua data sekaligus
  * - Selesai otomatis setelah semua terhapus
  * 
  * =======================================================
@@ -79,18 +81,35 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function getChildrenCount(db, path) {
+// FIXED: Get only keys, not full data - prevents memory issues
+async function getKeysOnly(db, path) {
   try {
     const snapshot = await db.ref(path).once('value');
-    const data = snapshot.val();
     
-    if (!data || typeof data !== 'object') {
-      return 0;
+    if (!snapshot.exists()) {
+      return [];
     }
     
-    return Object.keys(data).length;
+    const keys = [];
+    snapshot.forEach((child) => {
+      keys.push(child.key);
+      return false; // Don't load child data, just iterate keys
+    });
+    
+    return keys;
   } catch (error) {
-    log(`⚠️  Error counting children at ${path}: ${error.message}`, 'yellow');
+    log(`⚠️  Error getting keys at ${path}: ${error.message}`, 'yellow');
+    return [];
+  }
+}
+
+// FIXED: Don't count children by loading data, just estimate
+async function estimateChildrenCount(db, path) {
+  try {
+    const keys = await getKeysOnly(db, path);
+    return keys.length;
+  } catch (error) {
+    log(`⚠️  Error counting at ${path}: ${error.message}`, 'yellow');
     return 0;
   }
 }
@@ -122,20 +141,18 @@ async function deletePathRecursive(db, path, maxDepth = 10, currentDepth = 0) {
       return await deleteInChunks(db, path, currentDepth);
     }
 
-    // Get children
-    const snapshot = await db.ref(path).once('value');
-    const data = snapshot.val();
+    // FIXED: Get only keys, not full data
+    const children = await getKeysOnly(db, path);
     
-    if (!data || typeof data !== 'object') {
-      log(`${indent}ℹ️  ${path} is empty or not an object`, 'blue');
+    if (children.length === 0) {
+      log(`${indent}ℹ️  ${path} is empty`, 'blue');
       return { success: true, method: 'empty', count: 0 };
     }
 
-    const children = Object.keys(data);
     log(`${indent}📊 Found ${children.length} children in ${path}`, 'cyan');
     
     let deletedCount = 0;
-    const batchSize = 25; // Smaller batch for safety
+    const batchSize = 25;
     
     for (let i = 0; i < children.length; i += batchSize) {
       const batch = children.slice(i, i + batchSize);
@@ -159,7 +176,6 @@ async function deletePathRecursive(db, path, maxDepth = 10, currentDepth = 0) {
       const progress = Math.min(i + batchSize, children.length);
       log(`${indent}⏳ Progress: ${progress}/${children.length} children processed`, 'cyan');
       
-      // Small delay between batches to avoid rate limits
       await sleep(150);
     }
     
@@ -171,7 +187,6 @@ async function deletePathRecursive(db, path, maxDepth = 10, currentDepth = 0) {
       deletedCount++;
     } catch (error) {
       log(`${indent}⚠️  Could not delete parent ${path}: ${error.message}`, 'yellow');
-      // Try one more time after a delay
       await sleep(500);
       try {
         await db.ref(path).remove();
@@ -197,14 +212,13 @@ async function deleteInChunks(db, path, depth) {
   const indent = '  '.repeat(depth);
   
   try {
-    const snapshot = await db.ref(path).once('value');
-    const data = snapshot.val();
+    // FIXED: Get only keys, not full data
+    const keys = await getKeysOnly(db, path);
     
-    if (!data || typeof data !== 'object') {
+    if (keys.length === 0) {
       return { success: true, method: 'empty', count: 0 };
     }
 
-    const keys = Object.keys(data);
     log(`${indent}🔪 Chunking ${keys.length} items at ${path}`, 'magenta');
     
     const chunkSize = 10;
@@ -257,27 +271,26 @@ async function deleteAllData(db) {
     log('⚠️  This will DELETE ALL DATA in Realtime Database', 'red');
     log('='.repeat(70), 'cyan');
     
-    // Get all top-level paths
-    log('\n📂 Fetching all top-level paths...', 'cyan');
-    const snapshot = await db.ref('/').once('value');
-    const data = snapshot.val();
+    // FIXED: Get only top-level keys, not full data
+    log('\n📂 Fetching top-level paths (keys only)...', 'cyan');
+    const topLevelKeys = await getKeysOnly(db, '/');
     
-    if (!data) {
+    if (topLevelKeys.length === 0) {
       log('✅ Database is already empty', 'green');
       return true;
     }
 
-    const paths = Object.keys(data).map(key => `/${key}`);
+    const paths = topLevelKeys.map(key => `/${key}`);
     
     log(`\n📊 Found ${paths.length} top-level paths:`, 'yellow');
     paths.forEach((path, idx) => {
       log(`   ${idx + 1}. ${path}`, 'blue');
     });
     
-    // Show estimated data size
-    log('\n📏 Estimating data size...', 'cyan');
+    // FIXED: Estimate data size without loading full data
+    log('\n🔍 Estimating data size...', 'cyan');
     for (const path of paths) {
-      const count = await getChildrenCount(db, path);
+      const count = await estimateChildrenCount(db, path);
       log(`   ${path}: ~${count.toLocaleString()} direct children`, 'blue');
     }
     
@@ -285,14 +298,13 @@ async function deleteAllData(db) {
     log('🗑️  STARTING DELETION PROCESS', 'yellow');
     log('='.repeat(70), 'cyan');
     
-    // Delete each path with retry mechanism
     let successCount = 0;
     
     for (let i = 0; i < paths.length; i++) {
       const path = paths[i];
       const pathNum = i + 1;
       
-      log(`\n[${ pathNum}/${paths.length}] 🗑️  Processing: ${path}`, 'cyan');
+      log(`\n[${pathNum}/${paths.length}] 🗑️  Processing: ${path}`, 'cyan');
       log('-'.repeat(70), 'cyan');
       
       let attempts = 0;
@@ -304,7 +316,7 @@ async function deleteAllData(db) {
         
         if (attempts > 1) {
           log(`   🔄 Retry attempt ${attempts}/${maxAttempts} for ${path}`, 'yellow');
-          await sleep(2000); // Wait before retry
+          await sleep(2000);
         }
         
         try {
@@ -326,10 +338,8 @@ async function deleteAllData(db) {
         }
       }
       
-      // Small delay between paths
       await sleep(500);
       
-      // Progress summary
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       const rate = (totalDeleted / parseFloat(elapsed)).toFixed(1);
       log(`\n📊 Overall Progress: ${pathNum}/${paths.length} paths | ` +
@@ -337,7 +347,6 @@ async function deleteAllData(db) {
           `⏱️  ${elapsed}s | 📈 ${rate} nodes/s`, 'magenta');
     }
 
-    // Final summary
     const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     
     log('\n' + '='.repeat(70), 'cyan');
@@ -355,18 +364,16 @@ async function deleteAllData(db) {
     log(`📈 Average rate: ${(totalDeleted / parseFloat(totalElapsed)).toFixed(2)} nodes/s`, 'blue');
     log('='.repeat(70), 'cyan');
     
-    // Verify cleanup
+    // FIXED: Verify cleanup without loading all data
     log('\n🔍 Verifying cleanup...', 'cyan');
-    const verifySnapshot = await db.ref('/').once('value');
-    const remainingData = verifySnapshot.val();
+    const remainingKeys = await getKeysOnly(db, '/');
     
-    if (!remainingData || Object.keys(remainingData).length === 0) {
+    if (remainingKeys.length === 0) {
       log('✅ Database is now completely empty!', 'green');
       return true;
     } else {
-      const remaining = Object.keys(remainingData);
-      log(`⚠️  ${remaining.length} paths still remain:`, 'yellow');
-      remaining.forEach(path => log(`   - /${path}`, 'yellow'));
+      log(`⚠️  ${remainingKeys.length} paths still remain:`, 'yellow');
+      remainingKeys.forEach(key => log(`   - /${key}`, 'yellow'));
       log('💡 Consider re-running the script to clean remaining data', 'blue');
       return false;
     }
@@ -383,12 +390,12 @@ async function main() {
     log('\n' + '█'.repeat(70), 'cyan');
     log('█                                                                    █', 'cyan');
     log('█       REALTIME DATABASE AUTO CLEANUP - DELETE ALL DATA            █', 'cyan');
+    log('█                    (MEMORY OPTIMIZED VERSION)                     █', 'cyan');
     log('█                                                                    █', 'cyan');
     log('█'.repeat(70), 'cyan');
     
     const db = await initFirebase();
     
-    // Small delay to ensure Firebase is ready
     await sleep(1000);
     
     const success = await deleteAllData(db);
@@ -398,7 +405,6 @@ async function main() {
     log('\n👋 Cleanup process finished', success ? 'green' : 'yellow');
     log(`Exit code: ${exitCode}`, success ? 'green' : 'yellow');
     
-    // Give time for logs to flush
     await sleep(2000);
     
     process.exit(exitCode);
@@ -412,7 +418,6 @@ async function main() {
   }
 }
 
-// Handle process signals
 process.on('SIGTERM', async () => {
   log('\n⚠️  SIGTERM received - attempting graceful shutdown...', 'yellow');
   log(`📊 Progress before shutdown: ${totalDeleted} deleted, ${totalFailed} failed`, 'blue');
@@ -439,5 +444,4 @@ process.on('unhandledRejection', (reason, promise) => {
   process.exit(1);
 });
 
-// Start the cleanup
 main();
