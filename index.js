@@ -1,4 +1,4 @@
-// trading-simulator/index.js - NO AUTO-RETRY VERSION
+// trading-simulator/index.js 
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -115,7 +115,7 @@ class FirebaseManager {
         throw new Error('Firebase credentials incomplete in .env');
       }
 
-      logger.log('info', '⚡ Initializing Firebase (BINANCE-SYNCHRONIZED MODE)...');
+      logger.info('⚡ Initializing Firebase (BINANCE-SYNCHRONIZED MODE)...');
 
       if (!admin.apps.length) {
         admin.initializeApp({
@@ -138,11 +138,11 @@ class FirebaseManager {
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.log('info', '✅ Firebase Admin SDK initialized (BINANCE-SYNCED)');
-      logger.log('info', '✅ Firestore ready');
-      logger.log('info', '✅ Realtime DB Admin SDK ready');
-      logger.log('info', '💎 Crypto assets: Handled by backend Binance API (FREE)');
-      logger.log('info', '📊 Normal assets: Simulated by this service');
+      logger.info('✅ Firebase Admin SDK initialized (BINANCE-SYNCED)');
+      logger.info('✅ Firestore ready');
+      logger.info('✅ Realtime DB Admin SDK ready');
+      logger.info('💎 Crypto assets: Handled by backend Binance API (FREE)');
+      logger.info('📊 Normal assets: Simulated by this service');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -483,6 +483,11 @@ class FirebaseManager {
     }, this.CLEANUP_INTERVAL);
   }
 
+  /**
+   * ✅ OPTIMIZED: Stream-based batch processing untuk cleanup
+   * Menggunakan Admin SDK query untuk membaca data dalam batch
+   * Tidak load semua data ke memory, query dalam batch kecil
+   */
   async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
@@ -497,31 +502,91 @@ class FirebaseManager {
       { tf: '1d', retention: this.RETENTION_DAYS['1d'] },
     ];
     
+    const BATCH_DELETE_SIZE = 100; // Jumlah key per batch delete
+    const QUERY_BATCH_SIZE = 500;   // Jumlah key per query
+    
     for (const { tf, retention } of timeframes) {
+      const startTime = Date.now(); // Untuk metric
+      const cutoffTimestamp = TimezoneUtil.getCurrentTimestamp() - (retention * 86400);
+      const fullPath = `${path}/ohlc_${tf}`;
+      
+      logger.debug(`🗑️ Starting cleanup for ${asset.symbol} ${tf} (cutoff: ${cutoffTimestamp})`);
+      
+      let totalDeleted = 0;
+      let queryCount = 0;
+      
       try {
-        const cutoffTimestamp = TimezoneUtil.getCurrentTimestamp() - (retention * 86400);
-        
-        const snapshot = await this.realtimeDbAdmin.ref(`${path}/ohlc_${tf}`).once('value');
-        const data = snapshot.val();
-        
-        if (data) {
-          const oldKeys = Object.keys(data).filter(timestamp => {
-            return parseInt(timestamp) < cutoffTimestamp;
-          });
-
-          if (oldKeys.length > 0) {
-            logger.info(`  🗑️ Deleting ${oldKeys.length} old ${tf} bars for ${asset.symbol}`);
-            
+        // Loop sampai tidak ada data lama lagi
+        while (true) {
+          // Query: Ambil key yang lebih tua dari cutoff, batasi QUERY_BATCH_SIZE
+          const snapshot = await this.realtimeDbAdmin
+            .ref(fullPath)
+            .orderByKey()
+            .endAt(String(cutoffTimestamp))
+            .limitToFirst(QUERY_BATCH_SIZE)
+            .once('value');
+          
+          const data = snapshot.val();
+          
+          if (!data) {
+            break; // Sudah kosong atau tidak ada data lama
+          }
+          
+          const keys = Object.keys(data);
+          if (keys.length === 0) {
+            break; // Tidak ada data lama lagi
+          }
+          
+          // Filter keys (sudah di-order dan limited, tapi double-check)
+          const keysToDelete = keys.filter(key => parseInt(key) < cutoffTimestamp);
+          
+          if (keysToDelete.length === 0) {
+            break; // Tidak ada yang perlu dihapus
+          }
+          
+          // Delete dalam batch parallel
+          const deletePromises = [];
+          for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
+            const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
             const updates = {};
-            oldKeys.forEach(key => {
-              updates[`${path}/ohlc_${tf}/${key}`] = null;
+            batch.forEach(key => {
+              updates[`${fullPath}/${key}`] = null;
             });
-            
-            await this.realtimeDbAdmin.ref().update(updates);
+            deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
+          }
+          
+          // Tunggu semua batch selesai
+          await Promise.allSettled(deletePromises);
+          totalDeleted += keysToDelete.length;
+          queryCount++;
+          
+          // Log progress setiap 1000 record
+          if (totalDeleted % 1000 === 0) {
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            logger.info(`  🗑️ ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`);
+          }
+          
+          // Rate limiting: pause 100ms setiap 2000 deletions
+          if (totalDeleted % 2000 === 0) {
+            logger.debug(`  ⏸️  Rate limit pause 100ms...`);
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          
+          // Jika kurang dari QUERY_BATCH_SIZE, berarti sudah habis
+          if (keys.length < QUERY_BATCH_SIZE) {
+            break;
           }
         }
+        
+        const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+        if (totalDeleted > 0) {
+          logger.info(`✅ Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars in ${totalTime}s`);
+        } else {
+          logger.debug(`✅ Cleanup ${asset.symbol} ${tf}: No old data (${totalTime}s)`);
+        }
+        
       } catch (error) {
-        logger.debug(`No ${tf} data to cleanup for ${asset.symbol}`);
+        logger.error(`❌ Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
       }
     }
   }

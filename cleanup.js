@@ -1,17 +1,35 @@
 #!/usr/bin/env node
 
+/**
+ * =======================================================
+ * REALTIME DATABASE AUTO CLEANUP - DELETE ALL DATA
+ * =======================================================
+ * 
+ * CARA PAKAI:
+ * 1. Pastikan .env sudah dikonfigurasi dengan benar
+ * 2. Jalankan dengan PM2:
+ *    pm2 start cleanup-all-auto.js --name "db-cleanup"
+ * 
+ * 3. Monitor progress:
+ *    pm2 logs db-cleanup
+ * 
+ * 4. Stop jika perlu:
+ *    pm2 stop db-cleanup
+ * 
+ * Script ini akan:
+ * - Menghapus SEMUA data di Realtime Database
+ * - Otomatis batch untuk data besar
+ * - Recursive delete untuk path yang besar
+ * - Auto-retry jika gagal
+ * - Selesai otomatis setelah semua terhapus
+ * 
+ * =======================================================
+ */
+
 import admin from 'firebase-admin';
-import readline from 'readline';
 import dotenv from 'dotenv';
 
 dotenv.config();
-
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout
-});
-
-const question = (query) => new Promise((resolve) => rl.question(query, resolve));
 
 const colors = {
   reset: '\x1b[0m',
@@ -25,8 +43,13 @@ const colors = {
 };
 
 function log(message, color = 'reset') {
-  console.log(`${colors[color]}${message}${colors.reset}`);
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${colors[color]}${message}${colors.reset}`);
 }
+
+let totalDeleted = 0;
+let totalFailed = 0;
+let startTime = Date.now();
 
 async function initFirebase() {
   try {
@@ -52,481 +75,369 @@ async function initFirebase() {
   }
 }
 
-async function listAllPaths(db) {
-  try {
-    const snapshot = await db.ref('/').once('value');
-    const data = snapshot.val();
-    
-    if (!data) {
-      log('📭 No data found in Realtime Database', 'yellow');
-      return [];
-    }
-
-    const paths = Object.keys(data);
-    log('\n📂 Current paths in Realtime Database:', 'cyan');
-    paths.forEach((path, index) => {
-      log(`   ${index + 1}. /${path}`, 'blue');
-    });
-    
-    return paths;
-  } catch (error) {
-    log(`❌ Error listing paths: ${error.message}`, 'red');
-    return [];
-  }
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function getPathSize(db, path) {
+async function getChildrenCount(db, path) {
   try {
-    const snapshot = await db.ref(path).once('value');
-    const data = snapshot.val();
-    
-    if (!data) return { count: 0, size: 0 };
-    
-    const jsonString = JSON.stringify(data);
-    const sizeInBytes = Buffer.byteLength(jsonString, 'utf8');
-    const sizeInMB = (sizeInBytes / (1024 * 1024)).toFixed(2);
-    
-    const countNodes = (obj) => {
-      if (typeof obj !== 'object' || obj === null) return 1;
-      return Object.keys(obj).reduce((sum, key) => sum + countNodes(obj[key]), 1);
-    };
-    
-    const count = countNodes(data);
-    
-    return { count, size: sizeInMB };
-  } catch (error) {
-    return { count: 0, size: 0 };
-  }
-}
-
-async function deletePathRecursive(db, path, maxDepth = 5) {
-  try {
-    // Try direct delete first
-    try {
-      await db.ref(path).remove();
-      return { success: true, method: 'direct' };
-    } catch (error) {
-      if (!error.message.includes('WRITE_TOO_BIG')) {
-        throw error;
-      }
-    }
-
-    // If too big, delete children recursively
-    log(`   ⚠️  ${path} too large, deleting children...`, 'yellow');
-    
     const snapshot = await db.ref(path).once('value');
     const data = snapshot.val();
     
     if (!data || typeof data !== 'object') {
-      return { success: true, method: 'empty' };
+      return 0;
+    }
+    
+    return Object.keys(data).length;
+  } catch (error) {
+    log(`⚠️  Error counting children at ${path}: ${error.message}`, 'yellow');
+    return 0;
+  }
+}
+
+async function deletePathRecursive(db, path, maxDepth = 10, currentDepth = 0) {
+  const indent = '  '.repeat(currentDepth);
+  
+  try {
+    // Try direct delete first
+    try {
+      await db.ref(path).remove();
+      totalDeleted++;
+      log(`${indent}✅ Deleted: ${path}`, 'green');
+      return { success: true, method: 'direct', count: 1 };
+    } catch (error) {
+      // If error is not about size, throw it
+      if (!error.message.includes('WRITE_TOO_BIG') && 
+          !error.message.includes('too large') &&
+          !error.message.includes('413')) {
+        throw error;
+      }
+      
+      log(`${indent}⚠️  ${path} too large, deleting children recursively...`, 'yellow');
+    }
+
+    // If we reach max depth, try to delete in smaller chunks
+    if (currentDepth >= maxDepth) {
+      log(`${indent}⚠️  Max depth reached at ${path}, attempting chunk deletion...`, 'yellow');
+      return await deleteInChunks(db, path, currentDepth);
+    }
+
+    // Get children
+    const snapshot = await db.ref(path).once('value');
+    const data = snapshot.val();
+    
+    if (!data || typeof data !== 'object') {
+      log(`${indent}ℹ️  ${path} is empty or not an object`, 'blue');
+      return { success: true, method: 'empty', count: 0 };
     }
 
     const children = Object.keys(data);
-    log(`   📊 Found ${children.length} children in ${path}`, 'blue');
+    log(`${indent}📊 Found ${children.length} children in ${path}`, 'cyan');
     
     let deletedCount = 0;
-    const batchSize = 50;
+    const batchSize = 25; // Smaller batch for safety
     
     for (let i = 0; i < children.length; i += batchSize) {
       const batch = children.slice(i, i + batchSize);
       
-      await Promise.all(
+      const results = await Promise.allSettled(
         batch.map(async (childKey) => {
           const childPath = `${path}/${childKey}`;
-          
-          if (maxDepth > 0) {
-            await deletePathRecursive(db, childPath, maxDepth - 1);
-          } else {
-            await db.ref(childPath).remove();
-          }
-          
-          deletedCount++;
+          return await deletePathRecursive(db, childPath, maxDepth, currentDepth + 1);
         })
       );
       
-      log(`   ⏳ Progress: ${deletedCount}/${children.length} children deleted`, 'cyan');
+      results.forEach((result, idx) => {
+        if (result.status === 'fulfilled' && result.value.success) {
+          deletedCount += result.value.count || 1;
+        } else {
+          totalFailed++;
+          log(`${indent}❌ Failed to delete child ${batch[idx]}: ${result.reason?.message || 'Unknown error'}`, 'red');
+        }
+      });
       
-      // Small delay between batches
-      await new Promise(resolve => setTimeout(resolve, 200));
+      const progress = Math.min(i + batchSize, children.length);
+      log(`${indent}⏳ Progress: ${progress}/${children.length} children processed`, 'cyan');
+      
+      // Small delay between batches to avoid rate limits
+      await sleep(150);
     }
     
-    // Delete the parent after all children are gone
-    await db.ref(path).remove();
+    // Try to delete parent after all children are gone
+    try {
+      await db.ref(path).remove();
+      totalDeleted++;
+      log(`${indent}✅ Deleted parent: ${path}`, 'green');
+      deletedCount++;
+    } catch (error) {
+      log(`${indent}⚠️  Could not delete parent ${path}: ${error.message}`, 'yellow');
+      // Try one more time after a delay
+      await sleep(500);
+      try {
+        await db.ref(path).remove();
+        totalDeleted++;
+        log(`${indent}✅ Deleted parent (retry): ${path}`, 'green');
+        deletedCount++;
+      } catch (retryError) {
+        totalFailed++;
+        log(`${indent}❌ Failed to delete parent after retry: ${path}`, 'red');
+      }
+    }
     
-    return { success: true, method: 'recursive', deletedCount };
+    return { success: true, method: 'recursive', count: deletedCount };
     
   } catch (error) {
-    log(`   ❌ Error deleting ${path}: ${error.message}`, 'red');
-    return { success: false, error: error.message };
+    totalFailed++;
+    log(`${indent}❌ Error deleting ${path}: ${error.message}`, 'red');
+    return { success: false, error: error.message, count: 0 };
   }
 }
 
-async function deleteAll(db) {
-  const confirm = await question(
-    `${colors.red}${colors.bold}⚠️  DELETE ALL DATA? This cannot be undone! Type 'DELETE ALL' to confirm: ${colors.reset}`
-  );
+async function deleteInChunks(db, path, depth) {
+  const indent = '  '.repeat(depth);
   
-  if (confirm.trim() !== 'DELETE ALL') {
-    log('❌ Deletion cancelled', 'yellow');
-    return false;
-  }
-
   try {
-    log('\n📂 Fetching all paths to delete...', 'cyan');
+    const snapshot = await db.ref(path).once('value');
+    const data = snapshot.val();
     
-    // 1. Get all top-level paths
+    if (!data || typeof data !== 'object') {
+      return { success: true, method: 'empty', count: 0 };
+    }
+
+    const keys = Object.keys(data);
+    log(`${indent}🔪 Chunking ${keys.length} items at ${path}`, 'magenta');
+    
+    const chunkSize = 10;
+    let deletedCount = 0;
+    
+    for (let i = 0; i < keys.length; i += chunkSize) {
+      const chunk = keys.slice(i, i + chunkSize);
+      
+      for (const key of chunk) {
+        try {
+          await db.ref(`${path}/${key}`).remove();
+          deletedCount++;
+          totalDeleted++;
+        } catch (error) {
+          totalFailed++;
+          log(`${indent}❌ Failed to delete ${path}/${key}: ${error.message}`, 'red');
+        }
+        
+        await sleep(50);
+      }
+      
+      log(`${indent}⏳ Chunk progress: ${Math.min(i + chunkSize, keys.length)}/${keys.length}`, 'cyan');
+      await sleep(100);
+    }
+    
+    // Delete parent
+    try {
+      await db.ref(path).remove();
+      deletedCount++;
+      totalDeleted++;
+      log(`${indent}✅ Deleted chunked parent: ${path}`, 'green');
+    } catch (error) {
+      log(`${indent}⚠️  Could not delete chunked parent: ${error.message}`, 'yellow');
+    }
+    
+    return { success: true, method: 'chunked', count: deletedCount };
+    
+  } catch (error) {
+    totalFailed++;
+    log(`${indent}❌ Chunk deletion error: ${error.message}`, 'red');
+    return { success: false, error: error.message, count: 0 };
+  }
+}
+
+async function deleteAllData(db) {
+  try {
+    log('\n' + '='.repeat(70), 'cyan');
+    log('🚀 STARTING AUTOMATIC DATABASE CLEANUP', 'bold');
+    log('='.repeat(70), 'cyan');
+    log('⚠️  This will DELETE ALL DATA in Realtime Database', 'red');
+    log('='.repeat(70), 'cyan');
+    
+    // Get all top-level paths
+    log('\n📂 Fetching all top-level paths...', 'cyan');
     const snapshot = await db.ref('/').once('value');
     const data = snapshot.val();
     
     if (!data) {
-      log('🔭 Database is already empty', 'yellow');
+      log('✅ Database is already empty', 'green');
       return true;
     }
 
     const paths = Object.keys(data).map(key => `/${key}`);
     
-    log(`\n🗑️  Found ${paths.length} paths to delete:`, 'yellow');
-    paths.forEach(path => log(`   • ${path}`, 'blue'));
+    log(`\n📊 Found ${paths.length} top-level paths:`, 'yellow');
+    paths.forEach((path, idx) => {
+      log(`   ${idx + 1}. ${path}`, 'blue');
+    });
     
-    // 2. Delete each path (with recursive support for large paths)
-    log('\n⏳ Deleting paths (large paths will be deleted recursively)...', 'yellow');
+    // Show estimated data size
+    log('\n📏 Estimating data size...', 'cyan');
+    for (const path of paths) {
+      const count = await getChildrenCount(db, path);
+      log(`   ${path}: ~${count.toLocaleString()} direct children`, 'blue');
+    }
+    
+    log('\n' + '='.repeat(70), 'cyan');
+    log('🗑️  STARTING DELETION PROCESS', 'yellow');
+    log('='.repeat(70), 'cyan');
+    
+    // Delete each path with retry mechanism
     let successCount = 0;
-    let failCount = 0;
     
-    for (const path of paths) {
-      try {
-        log(`\n🗑️  Deleting ${path}...`, 'cyan');
+    for (let i = 0; i < paths.length; i++) {
+      const path = paths[i];
+      const pathNum = i + 1;
+      
+      log(`\n[${ pathNum}/${paths.length}] 🗑️  Processing: ${path}`, 'cyan');
+      log('-'.repeat(70), 'cyan');
+      
+      let attempts = 0;
+      const maxAttempts = 3;
+      let success = false;
+      
+      while (attempts < maxAttempts && !success) {
+        attempts++;
         
-        const result = await deletePathRecursive(db, path);
+        if (attempts > 1) {
+          log(`   🔄 Retry attempt ${attempts}/${maxAttempts} for ${path}`, 'yellow');
+          await sleep(2000); // Wait before retry
+        }
         
-        if (result.success) {
-          if (result.method === 'recursive') {
-            log(`   ✅ Deleted ${path} recursively (${result.deletedCount} children)`, 'green');
+        try {
+          const result = await deletePathRecursive(db, path);
+          
+          if (result.success) {
+            log(`   ✅ Successfully deleted ${path} (${result.method}, ${result.count} nodes)`, 'green');
+            successCount++;
+            success = true;
           } else {
-            log(`   ✅ Deleted ${path}`, 'green');
+            log(`   ⚠️  Partial deletion of ${path}: ${result.error}`, 'yellow');
           }
-          successCount++;
-        } else {
-          log(`   ❌ Failed to delete ${path}: ${result.error}`, 'red');
-          failCount++;
-        }
-        
-        // Small delay between paths
-        await new Promise(resolve => setTimeout(resolve, 300));
-        
-      } catch (error) {
-        log(`   ❌ Failed to delete ${path}: ${error.message}`, 'red');
-        failCount++;
-      }
-    }
-
-    // 3. Summary
-    log('\n' + '━'.repeat(50), 'cyan');
-    log(`✅ Successfully deleted ${successCount} paths`, 'green');
-    if (failCount > 0) {
-      log(`❌ Failed to delete ${failCount} paths`, 'red');
-    }
-    log('━'.repeat(50), 'cyan');
-    
-    return failCount === 0;
-
-  } catch (error) {
-    log(`\n❌ Error during deletion: ${error.message}`, 'red');
-    return false;
-  }
-}
-
-async function deleteSpecificPath(db, path) {
-  const stats = await getPathSize(db, path);
-  
-  log(`\n📊 Path: ${path}`, 'cyan');
-  log(`   Nodes: ${stats.count.toLocaleString()}`, 'blue');
-  log(`   Size: ~${stats.size} MB`, 'blue');
-  
-  const confirm = await question(
-    `${colors.yellow}Delete this path? (yes/no): ${colors.reset}`
-  );
-  
-  if (confirm.toLowerCase() !== 'yes') {
-    log('❌ Deletion cancelled', 'yellow');
-    return false;
-  }
-
-  try {
-    log(`\n🗑️  Deleting ${path}...`, 'yellow');
-    await db.ref(path).remove();
-    log(`✅ ${path} deleted successfully`, 'green');
-    return true;
-  } catch (error) {
-    log(`❌ Error deleting ${path}: ${error.message}`, 'red');
-    return false;
-  }
-}
-
-async function deleteOHLCData(db) {
-  try {
-    log('\n🔍 Scanning for OHLC data...', 'cyan');
-    
-    const snapshot = await db.ref('/').once('value');
-    const data = snapshot.val();
-    
-    if (!data) {
-      log('📭 No data found', 'yellow');
-      return false;
-    }
-
-    const ohlcPaths = [];
-    
-    for (const [key, value] of Object.entries(data)) {
-      if (typeof value === 'object' && value !== null) {
-        for (const subKey of Object.keys(value)) {
-          if (subKey.startsWith('ohlc_')) {
-            ohlcPaths.push(`/${key}/${subKey}`);
+        } catch (error) {
+          log(`   ❌ Attempt ${attempts} failed: ${error.message}`, 'red');
+          
+          if (attempts >= maxAttempts) {
+            log(`   ❌ Giving up on ${path} after ${maxAttempts} attempts`, 'red');
           }
         }
       }
+      
+      // Small delay between paths
+      await sleep(500);
+      
+      // Progress summary
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const rate = (totalDeleted / parseFloat(elapsed)).toFixed(1);
+      log(`\n📊 Overall Progress: ${pathNum}/${paths.length} paths | ` +
+          `✅ ${totalDeleted} deleted | ❌ ${totalFailed} failed | ` +
+          `⏱️  ${elapsed}s | 📈 ${rate} nodes/s`, 'magenta');
     }
 
-    if (ohlcPaths.length === 0) {
-      log('📭 No OHLC data found', 'yellow');
+    // Final summary
+    const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    
+    log('\n' + '='.repeat(70), 'cyan');
+    log('🎉 CLEANUP COMPLETED', 'bold');
+    log('='.repeat(70), 'cyan');
+    log(`✅ Successfully processed: ${successCount}/${paths.length} paths`, 'green');
+    log(`✅ Total nodes deleted: ${totalDeleted}`, 'green');
+    
+    if (totalFailed > 0) {
+      log(`❌ Total failures: ${totalFailed}`, 'red');
+      log(`⚠️  Some data might remain - check manually or re-run`, 'yellow');
+    }
+    
+    log(`⏱️  Total time: ${totalElapsed}s`, 'blue');
+    log(`📈 Average rate: ${(totalDeleted / parseFloat(totalElapsed)).toFixed(2)} nodes/s`, 'blue');
+    log('='.repeat(70), 'cyan');
+    
+    // Verify cleanup
+    log('\n🔍 Verifying cleanup...', 'cyan');
+    const verifySnapshot = await db.ref('/').once('value');
+    const remainingData = verifySnapshot.val();
+    
+    if (!remainingData || Object.keys(remainingData).length === 0) {
+      log('✅ Database is now completely empty!', 'green');
+      return true;
+    } else {
+      const remaining = Object.keys(remainingData);
+      log(`⚠️  ${remaining.length} paths still remain:`, 'yellow');
+      remaining.forEach(path => log(`   - /${path}`, 'yellow'));
+      log('💡 Consider re-running the script to clean remaining data', 'blue');
       return false;
     }
-
-    log(`\n📊 Found ${ohlcPaths.length} OHLC paths:`, 'cyan');
-    ohlcPaths.forEach((path, index) => {
-      log(`   ${index + 1}. ${path}`, 'blue');
-    });
-
-    const confirm = await question(
-      `${colors.yellow}\nDelete all OHLC data? (yes/no): ${colors.reset}`
-    );
-    
-    if (confirm.toLowerCase() !== 'yes') {
-      log('❌ Deletion cancelled', 'yellow');
-      return false;
-    }
-
-    log('\n🗑️  Deleting OHLC data...', 'yellow');
-    
-    for (const path of ohlcPaths) {
-      try {
-        await db.ref(path).remove();
-        log(`   ✅ Deleted ${path}`, 'green');
-      } catch (error) {
-        log(`   ❌ Failed to delete ${path}: ${error.message}`, 'red');
-      }
-    }
-
-    log(`\n✅ OHLC cleanup completed`, 'green');
-    return true;
 
   } catch (error) {
-    log(`❌ Error deleting OHLC data: ${error.message}`, 'red');
+    log(`\n❌ Fatal error during cleanup: ${error.message}`, 'red');
+    log(error.stack, 'red');
     return false;
   }
 }
 
-async function deleteOldData(db, daysOld) {
+async function main() {
   try {
-    log(`\n🔍 Scanning for data older than ${daysOld} days...`, 'cyan');
+    log('\n' + '█'.repeat(70), 'cyan');
+    log('█                                                                    █', 'cyan');
+    log('█       REALTIME DATABASE AUTO CLEANUP - DELETE ALL DATA            █', 'cyan');
+    log('█                                                                    █', 'cyan');
+    log('█'.repeat(70), 'cyan');
     
-    const cutoffTimestamp = Math.floor(Date.now() / 1000) - (daysOld * 86400);
-    const snapshot = await db.ref('/').once('value');
-    const data = snapshot.val();
+    const db = await initFirebase();
     
-    if (!data) {
-      log('📭 No data found', 'yellow');
-      return false;
-    }
-
-    const pathsToDelete = [];
+    // Small delay to ensure Firebase is ready
+    await sleep(1000);
     
-    for (const [key, value] of Object.entries(data)) {
-      if (typeof value === 'object' && value !== null) {
-        for (const [subKey, subValue] of Object.entries(value)) {
-          if (subKey.startsWith('ohlc_')) {
-            if (typeof subValue === 'object' && subValue !== null) {
-              const oldTimestamps = Object.keys(subValue).filter(ts => {
-                const timestamp = parseInt(ts);
-                return !isNaN(timestamp) && timestamp < cutoffTimestamp;
-              });
-
-              if (oldTimestamps.length > 0) {
-                oldTimestamps.forEach(ts => {
-                  pathsToDelete.push(`/${key}/${subKey}/${ts}`);
-                });
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (pathsToDelete.length === 0) {
-      log(`📭 No data older than ${daysOld} days found`, 'yellow');
-      return false;
-    }
-
-    log(`\n📊 Found ${pathsToDelete.length} old data nodes`, 'cyan');
-    log(`   Sample paths:`, 'blue');
-    pathsToDelete.slice(0, 5).forEach(path => {
-      log(`   - ${path}`, 'blue');
-    });
-    if (pathsToDelete.length > 5) {
-      log(`   ... and ${pathsToDelete.length - 5} more`, 'blue');
-    }
-
-    const confirm = await question(
-      `${colors.yellow}\nDelete all old data? (yes/no): ${colors.reset}`
-    );
+    const success = await deleteAllData(db);
     
-    if (confirm.toLowerCase() !== 'yes') {
-      log('❌ Deletion cancelled', 'yellow');
-      return false;
-    }
-
-    log('\n🗑️  Deleting old data...', 'yellow');
+    const exitCode = success ? 0 : 1;
     
-    const batchSize = 50;
-    for (let i = 0; i < pathsToDelete.length; i += batchSize) {
-      const batch = pathsToDelete.slice(i, i + batchSize);
-      
-      const updates = {};
-      batch.forEach(path => {
-        updates[path] = null;
-      });
-      
-      await db.ref('/').update(updates);
-      log(`   ✅ Deleted batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(pathsToDelete.length / batchSize)}`, 'green');
-    }
-
-    log(`\n✅ Deleted ${pathsToDelete.length} old data nodes`, 'green');
-    return true;
-
+    log('\n👋 Cleanup process finished', success ? 'green' : 'yellow');
+    log(`Exit code: ${exitCode}`, success ? 'green' : 'yellow');
+    
+    // Give time for logs to flush
+    await sleep(2000);
+    
+    process.exit(exitCode);
+    
   } catch (error) {
-    log(`❌ Error deleting old data: ${error.message}`, 'red');
-    return false;
+    log(`\n❌ Fatal error in main: ${error.message}`, 'red');
+    log(error.stack, 'red');
+    
+    await sleep(2000);
+    process.exit(1);
   }
 }
 
-async function showDatabaseStats(db) {
-  try {
-    log('\n📊 Database Statistics:', 'cyan');
-    log('━'.repeat(50), 'cyan');
-    
-    const snapshot = await db.ref('/').once('value');
-    const data = snapshot.val();
-    
-    if (!data) {
-      log('📭 Database is empty', 'yellow');
-      return;
-    }
+// Handle process signals
+process.on('SIGTERM', async () => {
+  log('\n⚠️  SIGTERM received - attempting graceful shutdown...', 'yellow');
+  log(`📊 Progress before shutdown: ${totalDeleted} deleted, ${totalFailed} failed`, 'blue');
+  await sleep(1000);
+  process.exit(0);
+});
 
-    const paths = Object.keys(data);
-    
-    for (const path of paths) {
-      const stats = await getPathSize(db, `/${path}`);
-      log(`\n/${path}:`, 'blue');
-      log(`   Nodes: ${stats.count.toLocaleString()}`, 'green');
-      log(`   Size: ~${stats.size} MB`, 'green');
-      
-      const pathData = data[path];
-      if (typeof pathData === 'object' && pathData !== null) {
-        const ohlcKeys = Object.keys(pathData).filter(k => k.startsWith('ohlc_'));
-        if (ohlcKeys.length > 0) {
-          log(`   OHLC timeframes: ${ohlcKeys.join(', ')}`, 'magenta');
-        }
-        if (pathData.current_price) {
-          log(`   Has current_price: ✓`, 'green');
-        }
-      }
-    }
-    
-    log('\n' + '━'.repeat(50), 'cyan');
+process.on('SIGINT', async () => {
+  log('\n⚠️  SIGINT received - attempting graceful shutdown...', 'yellow');
+  log(`📊 Progress before shutdown: ${totalDeleted} deleted, ${totalFailed} failed`, 'blue');
+  await sleep(1000);
+  process.exit(0);
+});
 
-  } catch (error) {
-    log(`❌ Error getting stats: ${error.message}`, 'red');
-  }
-}
-
-async function mainMenu() {
-  const db = await initFirebase();
-
-  log('\n' + '═'.repeat(60), 'cyan');
-  log('🗑️  REALTIME DATABASE CLEANUP TOOL', 'bold');
-  log('═'.repeat(60), 'cyan');
-
-  while (true) {
-    log('\n📋 Main Menu:', 'cyan');
-    log('━'.repeat(60), 'cyan');
-    log('1. 📊 Show database statistics', 'blue');
-    log('2. 📂 List all paths', 'blue');
-    log('3. 🗑️  Delete specific path', 'blue');
-    log('4. 🗑️  Delete all OHLC data', 'blue');
-    log('5. 🗑️  Delete old data (by age)', 'blue');
-    log('6. ⚠️  Delete ALL data (DANGEROUS!)', 'red');
-    log('0. 🚪 Exit', 'yellow');
-    log('━'.repeat(60), 'cyan');
-
-    const choice = await question(`${colors.green}Select option: ${colors.reset}`);
-
-    switch (choice.trim()) {
-      case '1':
-        await showDatabaseStats(db);
-        break;
-
-      case '2':
-        await listAllPaths(db);
-        break;
-
-      case '3': {
-        const paths = await listAllPaths(db);
-        if (paths.length === 0) break;
-        
-        const pathChoice = await question(`${colors.green}Enter path number or full path (e.g., /idx_stc): ${colors.reset}`);
-        
-        const pathIndex = parseInt(pathChoice) - 1;
-        const selectedPath = !isNaN(pathIndex) && pathIndex >= 0 && pathIndex < paths.length
-          ? `/${paths[pathIndex]}`
-          : pathChoice.startsWith('/') ? pathChoice : `/${pathChoice}`;
-        
-        await deleteSpecificPath(db, selectedPath);
-        break;
-      }
-
-      case '4':
-        await deleteOHLCData(db);
-        break;
-
-      case '5': {
-        const days = await question(`${colors.green}Delete data older than how many days? ${colors.reset}`);
-        const daysNum = parseInt(days);
-        
-        if (isNaN(daysNum) || daysNum < 0) {
-          log('❌ Invalid number of days', 'red');
-          break;
-        }
-        
-        await deleteOldData(db, daysNum);
-        break;
-      }
-
-      case '6':
-        await deleteAll(db);
-        break;
-
-      case '0':
-        log('\n👋 Goodbye!', 'green');
-        rl.close();
-        process.exit(0);
-
-      default:
-        log('❌ Invalid option', 'red');
-    }
-  }
-}
-
-mainMenu().catch(error => {
-  log(`❌ Fatal error: ${error.message}`, 'red');
+process.on('uncaughtException', (error) => {
+  log(`\n❌ Uncaught exception: ${error.message}`, 'red');
+  log(error.stack, 'red');
   process.exit(1);
 });
+
+process.on('unhandledRejection', (reason, promise) => {
+  log(`\n❌ Unhandled rejection at ${promise}`, 'red');
+  log(`Reason: ${reason}`, 'red');
+  process.exit(1);
+});
+
+// Start the cleanup
+main();
