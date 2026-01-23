@@ -80,6 +80,7 @@ class FirebaseManager {
     };
     
     this.RETENTION_DAYS = {
+      '1s': 0.000694,
       '1m': 2,
       '5m': 2,
       '15m': 3,
@@ -112,7 +113,7 @@ class FirebaseManager {
         throw new Error('Firebase credentials incomplete in .env');
       }
 
-      logger.info('⚡ Initializing Firebase (BINANCE-SYNCHRONIZED MODE)...');
+      logger.info('Initializing Firebase');
 
       if (!admin.apps.length) {
         admin.initializeApp({
@@ -135,11 +136,7 @@ class FirebaseManager {
       this.consecutiveErrors = 0;
       this.reconnectAttempts = 0;
       
-      logger.info('✅ Firebase Admin SDK initialized (BINANCE-SYNCED)');
-      logger.info('✅ Firestore ready');
-      logger.info('✅ Realtime DB Admin SDK ready');
-      logger.info('💎 Crypto assets: Handled by backend Binance API (FREE)');
-      logger.info('📊 Normal assets: Simulated by this service');
+      logger.info('Firebase Admin SDK initialized');
       
       this.startQueueProcessor();
       this.startCleanupScheduler();
@@ -147,7 +144,7 @@ class FirebaseManager {
       
       return true;
     } catch (error) {
-      logger.error(`❌ Firebase initialization error: ${error.message}`);
+      logger.error(`Firebase initialization error: ${error.message}`);
       await this.handleConnectionError(error);
       return false;
     }
@@ -157,10 +154,10 @@ class FirebaseManager {
     try {
       await this.db.collection('_health_check').limit(1).get();
       await this.realtimeDbAdmin.ref('/.info/connected').once('value');
-      logger.debug('✅ Connection test passed');
+      logger.debug('Connection test passed');
       return true;
     } catch (error) {
-      logger.error(`❌ Connection test failed: ${error.message}`);
+      logger.error(`Connection test failed: ${error.message}`);
       throw error;
     }
   }
@@ -170,7 +167,6 @@ class FirebaseManager {
     this.consecutiveErrors++;
     
     if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
-      logger.error(`❌ Too many consecutive errors (${this.consecutiveErrors}). Critical failure.`);
       throw new Error('Firebase connection critically failed');
     }
 
@@ -178,14 +174,14 @@ class FirebaseManager {
       this.reconnectAttempts++;
       const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
       
-      logger.warn(`⚠️ Reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms...`);
+      logger.warn(`Reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
       
       await new Promise(resolve => setTimeout(resolve, delay));
       
       try {
         await this.initialize();
       } catch (retryError) {
-        logger.error(`❌ Reconnection failed: ${retryError.message}`);
+        logger.error(`Reconnection failed: ${retryError.message}`);
       }
     }
   }
@@ -197,11 +193,10 @@ class FirebaseManager {
         this.lastHeartbeat = Date.now();
         this.consecutiveErrors = 0;
       } catch (error) {
-        logger.warn(`⚠️ Heartbeat failed: ${error.message}`);
+        logger.warn(`Heartbeat failed: ${error.message}`);
         this.consecutiveErrors++;
         
         if (this.consecutiveErrors >= 3) {
-          logger.error('❌ Multiple heartbeat failures, attempting reconnection...');
           await this.handleConnectionError(error);
         }
       }
@@ -210,7 +205,7 @@ class FirebaseManager {
 
   async getAssets() {
     if (!this.isConnected) {
-      logger.warn('⚠️ Firebase not connected, skipping asset fetch');
+      logger.warn('Firebase not connected, skipping asset fetch');
       return [];
     }
 
@@ -235,7 +230,7 @@ class FirebaseManager {
         
         if (!data.category) {
           skippedAssets.missingCategory.push(data.symbol);
-          logger.warn(`⚠️ Asset ${data.symbol} missing category field, skipping`);
+          logger.warn(`Asset ${data.symbol} missing category field, skipping`);
           return;
         }
         
@@ -245,7 +240,7 @@ class FirebaseManager {
             dataSource: data.dataSource,
             path: data.realtimeDbPath || 'auto-generated'
           });
-          logger.debug(`💎 Skipping crypto asset: ${data.symbol} (backend Binance handles this)`);
+          logger.debug(`Skipping crypto asset: ${data.symbol}`);
           return;
         }
         
@@ -254,7 +249,7 @@ class FirebaseManager {
             symbol: data.symbol,
             issue: `Unknown category: ${data.category}`
           });
-          logger.warn(`⚠️ Unknown category '${data.category}' for ${data.symbol}, skipping`);
+          logger.warn(`Unknown category '${data.category}' for ${data.symbol}, skipping`);
           return;
         }
         
@@ -265,18 +260,18 @@ class FirebaseManager {
             dataSource: data.dataSource,
             expected: validSources.join(', ')
           });
-          logger.error(`❌ Asset ${data.symbol} has invalid dataSource '${data.dataSource}' for simulator`);
+          logger.error(`Asset ${data.symbol} has invalid dataSource '${data.dataSource}' for simulator`);
           return;
         }
         
         if (data.dataSource === 'realtime_db' && !data.realtimeDbPath) {
           skippedAssets.missingPath.push(data.symbol);
-          logger.error(`❌ Asset ${data.symbol} with realtime_db source MUST have realtimeDbPath, skipping`);
+          logger.error(`Asset ${data.symbol} with realtime_db source MUST have realtimeDbPath, skipping`);
           return;
         }
         
         if (!data.simulatorSettings) {
-          logger.info(`ℹ️ Asset ${data.symbol} missing simulatorSettings, will use defaults`);
+          logger.info(`Asset ${data.symbol} missing simulatorSettings, will use defaults`);
         }
         
         normalAssets.push({ 
@@ -288,65 +283,18 @@ class FirebaseManager {
 
       if (normalAssets.length > 0) {
         logger.info('');
-        logger.info(`📊 ============================================`);
-        logger.info(`📊 LOADED ${normalAssets.length} NORMAL ASSETS FOR SIMULATION`);
-        logger.info(`📊 ============================================`);
+        logger.info(`Loaded ${normalAssets.length} normal assets for simulation`);
         normalAssets.forEach(a => {
           const pathDisplay = this.getAssetPathPreview(a);
-          logger.info(`   ✓ ${a.symbol} (${a.dataSource}) → ${pathDisplay}`);
+          logger.info(`${a.symbol} (${a.dataSource}) → ${pathDisplay}`);
         });
-        logger.info(`📊 ============================================`);
-        logger.info('');
       }
 
-      const totalSkipped = Object.values(skippedAssets).reduce((sum, arr) => sum + arr.length, 0);
-      if (totalSkipped > 0) {
-        logger.info('');
-        logger.info(`⚠️ ============================================`);
-        logger.info(`⚠️ SKIPPED ${totalSkipped} ASSETS (NOT FOR SIMULATOR)`);
-        logger.info(`⚠️ ============================================`);
-        
-        if (skippedAssets.cryptoAssets.length > 0) {
-          logger.info(`   💎 Crypto Assets (${skippedAssets.cryptoAssets.length}) - Backend Binance handles:`);
-          skippedAssets.cryptoAssets.forEach(a => {
-            logger.info(`      • ${a.symbol} (${a.dataSource}) → ${a.path}`);
-          });
-        }
-        
-        if (skippedAssets.missingCategory.length > 0) {
-          logger.warn(`   ❌ Missing Category (${skippedAssets.missingCategory.length}):`);
-          logger.warn(`      ${skippedAssets.missingCategory.join(', ')}`);
-        }
-        
-        if (skippedAssets.invalidDataSource.length > 0) {
-          logger.error(`   ❌ Invalid DataSource (${skippedAssets.invalidDataSource.length}):`);
-          skippedAssets.invalidDataSource.forEach(a => {
-            logger.error(`      • ${a.symbol}: '${a.dataSource}' (expected: ${a.expected})`);
-          });
-        }
-        
-        if (skippedAssets.missingPath.length > 0) {
-          logger.error(`   ❌ Missing Path (${skippedAssets.missingPath.length}):`);
-          logger.error(`      ${skippedAssets.missingPath.join(', ')}`);
-        }
-        
-        if (skippedAssets.validationErrors.length > 0) {
-          logger.error(`   ❌ Validation Errors (${skippedAssets.validationErrors.length}):`);
-          skippedAssets.validationErrors.forEach(e => {
-            logger.error(`      • ${e.symbol}: ${e.issue}`);
-          });
-        }
-        
-        logger.info(`⚠️ ============================================`);
-        logger.info('');
-      }
-
-      logger.debug(`📊 Firestore read #${this.firestoreReadCount}: ${normalAssets.length} normal assets, ${totalSkipped} skipped`);
+      logger.debug(`Firestore read #${this.firestoreReadCount}: ${normalAssets.length} normal assets`);
 
       return normalAssets;
     } catch (error) {
-      logger.error(`❌ Error fetching assets: ${error.message}`);
-      logger.error(error.stack);
+      logger.error(`Error fetching assets: ${error.message}`);
       this.consecutiveErrors++;
       return [];
     }
@@ -410,7 +358,7 @@ class FirebaseManager {
         } else {
           this.writeStats.failed++;
           this.consecutiveErrors++;
-          logger.error(`❌ Write failed at ${path}: ${error.message}`);
+          logger.error(`Write failed at ${path}: ${error.message}`);
           
           if (this.consecutiveErrors >= 3) {
             await this.handleConnectionError(error);
@@ -428,7 +376,7 @@ class FirebaseManager {
     this.writeQueue.push({ path, data, addedAt: Date.now() });
     
     if (this.writeQueue.length > 500) {
-      logger.warn(`⚠️ Write queue overflow (${this.writeQueue.length}), dropping oldest entries`);
+      logger.warn(`Write queue overflow (${this.writeQueue.length}), dropping oldest entries`);
       this.writeQueue = this.writeQueue.slice(-250);
     }
   }
@@ -462,7 +410,7 @@ class FirebaseManager {
         return;
       }
 
-      logger.info('🗑️ Starting automatic cleanup...');
+      logger.info('Starting automatic cleanup');
       
       try {
         const assets = await this.getAssets();
@@ -472,10 +420,10 @@ class FirebaseManager {
         }
 
         this.lastCleanupTime = now;
-        logger.info('✅ Cleanup completed');
+        logger.info('Cleanup completed');
         
       } catch (error) {
-        logger.error(`❌ Cleanup error: ${error.message}`);
+        logger.error(`Cleanup error: ${error.message}`);
       }
     }, this.CLEANUP_INTERVAL);
   }
@@ -484,24 +432,27 @@ class FirebaseManager {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
-      { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
-      { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
-      { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
-      { tf: '30m', retention: this.RETENTION_DAYS['30m'] },
-      { tf: '1h', retention: this.RETENTION_DAYS['1h'] },
-      { tf: '4h', retention: this.RETENTION_DAYS['4h'] },
-      { tf: '1d', retention: this.RETENTION_DAYS['1d'] },
+      { tf: '1s', retention: this.RETENTION_DAYS['1s'], isSeconds: true },
+      { tf: '1m', retention: this.RETENTION_DAYS['1m'], isSeconds: false },
+      { tf: '5m', retention: this.RETENTION_DAYS['5m'], isSeconds: false },
+      { tf: '15m', retention: this.RETENTION_DAYS['15m'], isSeconds: false },
+      { tf: '30m', retention: this.RETENTION_DAYS['30m'], isSeconds: false },
+      { tf: '1h', retention: this.RETENTION_DAYS['1h'], isSeconds: false },
+      { tf: '4h', retention: this.RETENTION_DAYS['4h'], isSeconds: false },
+      { tf: '1d', retention: this.RETENTION_DAYS['1d'], isSeconds: false },
     ];
     
     const BATCH_DELETE_SIZE = 100;
     const QUERY_BATCH_SIZE = 500;
+    const MAX_1S_BARS = 60;
     
-    for (const { tf, retention } of timeframes) {
+    for (const { tf, retention, isSeconds } of timeframes) {
       const startTime = Date.now();
-      const cutoffTimestamp = TimezoneUtil.getCurrentTimestamp() - (retention * 86400);
+      const now = TimezoneUtil.getCurrentTimestamp();
+      const cutoffTimestamp = isSeconds ? now - 60 : now - (retention * 86400);
       const fullPath = `${path}/ohlc_${tf}`;
       
-      logger.debug(`🗑️ Starting cleanup for ${asset.symbol} ${tf} (cutoff: ${cutoffTimestamp})`);
+      logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (cutoff: ${cutoffTimestamp})`);
       
       let totalDeleted = 0;
       let queryCount = 0;
@@ -511,7 +462,7 @@ class FirebaseManager {
           const snapshot = await this.realtimeDbAdmin
             .ref(fullPath)
             .orderByKey()
-            .endAt(String(cutoffTimestamp))
+            .endAt(String(tf === '1s' ? now : cutoffTimestamp))
             .limitToFirst(QUERY_BATCH_SIZE)
             .once('value');
           
@@ -521,45 +472,65 @@ class FirebaseManager {
           const keys = Object.keys(data);
           if (keys.length === 0) break;
           
-          const keysToDelete = keys.filter(key => parseInt(key) < cutoffTimestamp);
-          if (keysToDelete.length === 0) break;
-          
-          const deletePromises = [];
-          for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
-            const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
-            const updates = {};
-            batch.forEach(key => {
-              updates[`${fullPath}/${key}`] = null;
-            });
-            deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
+          if (tf === '1s') {
+            if (keys.length > MAX_1S_BARS) {
+              const excessCount = keys.length - MAX_1S_BARS;
+              const keysToDelete = keys.slice(0, excessCount);
+              const deletePromises = [];
+              
+              for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
+                const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
+                const updates = {};
+                batch.forEach(key => {
+                  updates[`${fullPath}/${key}`] = null;
+                });
+                deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
+              }
+              
+              await Promise.allSettled(deletePromises);
+              totalDeleted += keysToDelete.length;
+            }
+          } else {
+            const keysToDelete = keys.filter(key => parseInt(key) < cutoffTimestamp);
+            if (keysToDelete.length === 0) break;
+            
+            const deletePromises = [];
+            for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
+              const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
+              const updates = {};
+              batch.forEach(key => {
+                updates[`${fullPath}/${key}`] = null;
+              });
+              deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
+            }
+            
+            await Promise.allSettled(deletePromises);
+            totalDeleted += keysToDelete.length;
           }
           
-          await Promise.allSettled(deletePromises);
-          totalDeleted += keysToDelete.length;
           queryCount++;
           
           if (totalDeleted % 1000 === 0) {
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            logger.info(`  🗑️ ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`);
+            logger.info(`${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`);
           }
           
-          if (totalDeleted % 2000 === 0) {
-            logger.debug(`  ⏸️  Rate limit pause 100ms...`);
+          if (queryCount % 20 === 0) {
             await new Promise(resolve => setTimeout(resolve, 100));
           }
           
-          if (keys.length < QUERY_BATCH_SIZE) break;
+          if (Object.keys(data).length < QUERY_BATCH_SIZE) break;
         }
         
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         if (totalDeleted > 0) {
-          logger.info(`✅ Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars in ${totalTime}s`);
+          logger.info(`Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars in ${totalTime}s`);
         } else {
-          logger.debug(`✅ Cleanup ${asset.symbol} ${tf}: No old data (${totalTime}s)`);
+          logger.debug(`Cleanup ${asset.symbol} ${tf}: No old data (${totalTime}s)`);
         }
         
       } catch (error) {
-        logger.error(`❌ Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
+        logger.error(`Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
       }
     }
   }
@@ -568,58 +539,45 @@ class FirebaseManager {
     if (asset.dataSource === 'realtime_db') {
       if (!asset.realtimeDbPath) {
         const errorMsg = `CRITICAL: Asset ${asset.symbol} has realtime_db source but missing realtimeDbPath`;
-        logger.error(`❌ ${errorMsg}`);
+        logger.error(errorMsg);
         throw new Error(errorMsg);
       }
       
       let path = asset.realtimeDbPath.trim();
       
       if (!path.startsWith('/')) {
-        logger.warn(`⚠️ Asset ${asset.symbol} path missing leading /, fixing: ${path} → /${path}`);
         path = `/${path}`;
       }
       
       if (path.endsWith('/') && path !== '/') {
-        logger.warn(`⚠️ Asset ${asset.symbol} path has trailing /, fixing: ${path}`);
         path = path.slice(0, -1);
       }
       
       if (path.includes('//')) {
-        logger.warn(`⚠️ Asset ${asset.symbol} path has double slashes, fixing`);
         path = path.replace(/\/+/g, '/');
       }
       
       const invalidChars = /[^a-zA-Z0-9/_-]/g;
       if (invalidChars.test(path)) {
-        logger.error(`❌ Asset ${asset.symbol} path contains invalid characters: ${path}`);
+        logger.error(`Asset ${asset.symbol} path contains invalid characters: ${path}`);
         throw new Error(`Invalid characters in realtimeDbPath for ${asset.symbol}`);
       }
       
-      logger.debug(`✅ Asset ${asset.symbol} validated path: ${path}`);
       return path;
     }
     
     if (asset.dataSource === 'mock') {
-      const path = `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      logger.debug(`✅ Asset ${asset.symbol} mock path: ${path}`);
-      return path;
+      return `/mock/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
     }
     
-    if (asset.dataSource === 'api') {
-      if (asset.realtimeDbPath) {
-        let path = asset.realtimeDbPath.trim();
-        if (!path.startsWith('/')) path = `/${path}`;
-        logger.debug(`✅ Asset ${asset.symbol} API with RT DB path: ${path}`);
-        return path;
-      }
-      
-      const path = `/api/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      logger.debug(`✅ Asset ${asset.symbol} API auto-generated path: ${path}`);
+    if (asset.dataSource === 'api' && asset.apiEndpoint) {
+      let path = asset.realtimeDbPath?.trim() || `/api/${asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      if (!path.startsWith('/')) path = `/${path}`;
       return path;
     }
     
     const errorMsg = `Invalid dataSource for ${asset.symbol}: ${asset.dataSource}`;
-    logger.error(`❌ ${errorMsg}`);
+    logger.error(errorMsg);
     throw new Error(errorMsg);
   }
 
@@ -661,14 +619,14 @@ class FirebaseManager {
   }
 
   async shutdown() {
-    logger.info('🛑 Shutting down Firebase Manager...');
+    logger.info('Shutting down Firebase Manager');
     
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
     }
     
     if (this.writeQueue.length > 0) {
-      logger.info(`📤 Processing ${this.writeQueue.length} remaining writes...`);
+      logger.info(`Processing ${this.writeQueue.length} remaining writes`);
       
       while (this.writeQueue.length > 0) {
         const batch = this.writeQueue.splice(0, 10);
@@ -678,13 +636,14 @@ class FirebaseManager {
       }
     }
     
-    logger.info('✅ Firebase Manager shutdown complete');
+    logger.info('Firebase Manager shutdown complete');
   }
 }
 
 class TimeframeManager {
   constructor() {
     this.timeframes = {
+      '1s': 1,
       '1m': 60,
       '5m': 300,
       '15m': 900,
@@ -769,10 +728,8 @@ class AssetSimulator {
 
     const settings = asset.simulatorSettings || {};
     
-    // ✅ PRESERVE HIGH PRECISION - Don't use fallbacks that might lose precision
     this.initialPrice = settings.initialPrice || 40.022;
     
-    // ✅ Store original precision values
     if (settings.minPrice !== undefined && settings.minPrice !== null) {
       this.minPrice = settings.minPrice;
     } else {
@@ -786,24 +743,8 @@ class AssetSimulator {
     }
     
     this.currentPrice = this.initialPrice;
-    
-    // ✅ PRESERVE HIGH PRECISION volatility
     this.volatilityMin = settings.secondVolatilityMin || 0.00001;
     this.volatilityMax = settings.secondVolatilityMax || 0.00008;
-    
-    // ✅ Calculate precision needed based on price range
-    this.priceRange = this.maxPrice - this.minPrice;
-    
-    // Determine decimal places needed
-    // If range is 0.0009 (9e-4), we need at least 4 decimal places
-    // If range is 0.00000009 (9e-8), we need at least 8 decimal places
-    const exponent = Math.floor(Math.log10(this.priceRange));
-    this.decimalPlaces = Math.max(6, Math.abs(exponent) + 2); // At least 6, or more if needed
-    
-    // ✅ For very small ranges, use more precision
-    if (this.priceRange < 0.001) {
-      this.decimalPlaces = 10; // Maximum precision
-    }
     
     this.lastDirection = 1;
     this.iteration = 0;
@@ -817,30 +758,22 @@ class AssetSimulator {
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
     logger.info('');
-    logger.info(`✅ Simulator initialized: ${asset.symbol}`);
-    logger.info(`   Name: ${asset.name}`);
-    logger.info(`   Category: ${asset.category || 'normal'}`);
-    logger.info(`   DataSource: ${asset.dataSource}`);
-    logger.info(`   Path: ${this.realtimeDbPath}`);
-    logger.info(`   📊 SETTINGS (HIGH PRECISION):`);
-    logger.info(`      Initial Price: ${this.initialPrice}`);
-    logger.info(`      Min Price: ${this.minPrice} ${settings.minPrice !== undefined ? '✔' : '(default)'}`);
-    logger.info(`      Max Price: ${this.maxPrice} ${settings.maxPrice !== undefined ? '✔' : '(default)'}`);
-    logger.info(`      Range Width: ${this.priceRange.toExponential()} (${this.priceRange})`);
-    logger.info(`      Decimal Places: ${this.decimalPlaces}`);
-    logger.info(`      Volatility: ${this.volatilityMin.toExponential()} - ${this.volatilityMax.toExponential()}`);
-    
-    // ✅ Warn if volatility might cause issues
-    const maxChangePerUpdate = this.initialPrice * this.volatilityMax;
-    if (maxChangePerUpdate > this.priceRange) {
-      logger.warn(`      ⚠️  Max change (${maxChangePerUpdate.toExponential()}) > Range (${this.priceRange.toExponential()})`);
-      logger.warn(`      ⚠️  Price may hit boundaries frequently`);
-    }
+    logger.info(`Simulator initialized: ${asset.symbol}`);
+    logger.info(`Name: ${asset.name}`);
+    logger.info(`Category: ${asset.category || 'normal'}`);
+    logger.info(`DataSource: ${asset.dataSource}`);
+    logger.info(`Path: ${this.realtimeDbPath}`);
+    logger.info(`SETTINGS:`);
+    logger.info(`Initial Price: ${this.initialPrice}`);
+    logger.info(`Min Price: ${this.minPrice}`);
+    logger.info(`Max Price: ${this.maxPrice}`);
+    logger.info(`Range Width: ${(this.maxPrice - this.minPrice).toFixed(2)}`);
+    logger.info(`Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
   }
 
   async loadLastPrice() {
     try {
-      logger.info(`🔍 [${this.asset.symbol}] Checking last price...`);
+      logger.info(`[${this.asset.symbol}] Checking last price`);
       
       const lastPriceData = await this.firebase.getLastPrice(this.realtimeDbPath);
       
@@ -852,22 +785,21 @@ class AssetSimulator {
           this.lastPriceData = lastPriceData;
           this.isResumed = true;
           
-          logger.info(`🔄 [${this.asset.symbol}] RESUMED: ${price} (within ${this.minPrice}-${this.maxPrice})`);
+          logger.info(`[${this.asset.symbol}] RESUMED: ${price.toFixed(6)}`);
           return true;
         } else {
-          logger.warn(`⚠️ [${this.asset.symbol}] Last price ${price} outside range ${this.minPrice}-${this.maxPrice}, resetting to initial`);
+          logger.warn(`[${this.asset.symbol}] Last price ${price} outside range, resetting to initial`);
         }
       }
       
-      logger.info(`ℹ️ [${this.asset.symbol}] Starting fresh: ${this.initialPrice}`);
+      logger.info(`[${this.asset.symbol}] Starting fresh: ${this.initialPrice}`);
       return false;
     } catch (error) {
-      logger.warn(`⚠️ [${this.asset.symbol}] Could not load last price: ${error.message}`);
+      logger.warn(`[${this.asset.symbol}] Could not load last price: ${error.message}`);
       return false;
     }
   }
 
-  // ✅ MODIFIED: High precision price movement
   generatePriceMovement() {
     const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
     
@@ -877,11 +809,9 @@ class AssetSimulator {
     }
     this.lastDirection = direction;
     
-    // ✅ HIGH PRECISION: Use full precision for calculation
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // ✅ Enforce boundaries WITHOUT losing precision
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice;
       this.lastDirection = 1;
@@ -893,17 +823,7 @@ class AssetSimulator {
       logger.debug(`[${this.asset.symbol}] Hit max price ${this.maxPrice}, bouncing down`);
     }
     
-    // ✅ NO ROUNDING - Return full precision
     return newPrice;
-  }
-
-  // ✅ MODIFIED: Format price with appropriate precision
-  formatPrice(price) {
-    // For very small numbers, use exponential notation in logs but keep full precision in DB
-    if (this.priceRange < 0.0001) {
-      return price.toFixed(this.decimalPlaces);
-    }
-    return price.toFixed(Math.min(this.decimalPlaces, 10));
   }
 
   async updatePrice() {
@@ -924,14 +844,13 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
-      // ✅ STORE WITH FULL PRECISION - Don't round
       const currentPriceData = {
-        price: newPrice, // ✅ Store full precision
+        price: parseFloat(newPrice.toFixed(6)),
         timestamp: timestamp,
         datetime: dateTimeInfo.datetime,
         datetime_iso: dateTimeInfo.datetime_iso,
         timezone: 'Asia/Jakarta',
-        change: (newPrice - this.initialPrice) / this.initialPrice * 100,
+        change: parseFloat(((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
       };
       
       const writeSuccess = await this.firebase.setRealtimeValue(
@@ -943,7 +862,7 @@ class AssetSimulator {
         this.consecutiveErrors++;
         
         if (this.consecutiveErrors >= this.MAX_ERRORS) {
-          logger.error(`❌ [${this.asset.symbol}] Too many errors, skipping update cycle`);
+          logger.error(`[${this.asset.symbol}] Too many errors, skipping update cycle`);
           this.consecutiveErrors = 0;
           return;
         }
@@ -951,7 +870,6 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
-      // ✅ OHLC bars with full precision
       for (const [tf, bar] of Object.entries(currentBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -961,10 +879,10 @@ class AssetSimulator {
           datetime: barDateTime.datetime,
           datetime_iso: barDateTime.datetime_iso,
           timezone: 'Asia/Jakarta',
-          open: bar.open,     // ✅ Full precision
-          high: bar.high,     // ✅ Full precision
-          low: bar.low,       // ✅ Full precision
-          close: bar.close,   // ✅ Full precision
+          open: parseFloat(bar.open.toFixed(6)),
+          high: parseFloat(bar.high.toFixed(6)),
+          low: parseFloat(bar.low.toFixed(6)),
+          close: parseFloat(bar.close.toFixed(6)),
           volume: bar.volume,
           isCompleted: false
         };
@@ -984,10 +902,10 @@ class AssetSimulator {
           datetime: barDateTime.datetime,
           datetime_iso: barDateTime.datetime_iso,
           timezone: 'Asia/Jakarta',
-          open: bar.open,     // ✅ Full precision
-          high: bar.high,     // ✅ Full precision
-          low: bar.low,       // ✅ Full precision
-          close: bar.close,   // ✅ Full precision
+          open: parseFloat(bar.open.toFixed(6)),
+          high: parseFloat(bar.high.toFixed(6)),
+          low: parseFloat(bar.low.toFixed(6)),
+          close: parseFloat(bar.close.toFixed(6)),
           volume: bar.volume,
           isCompleted: true
         };
@@ -1001,26 +919,22 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
-      // ✅ Log with appropriate precision
       if (now - this.lastLogTime > 30000) {
-        const pricePosition = ((newPrice - this.minPrice) / this.priceRange * 100).toFixed(2);
-        const priceDisplay = this.formatPrice(newPrice);
-        const rangeDisplay = `${this.formatPrice(this.minPrice)}-${this.formatPrice(this.maxPrice)}`;
-        
+        const pricePosition = ((newPrice - this.minPrice) / (this.maxPrice - this.minPrice) * 100).toFixed(1);
         logger.info(
-          `[${this.asset.symbol}] ${this.isResumed ? '🔄' : '🆕'} | ` +
-          `#${this.iteration}: ${priceDisplay} ` +
-          `(${pricePosition}% in ${rangeDisplay})`
+          `[${this.asset.symbol}] ${this.isResumed ? '' : ''} | ` +
+          `#${this.iteration}: ${newPrice.toFixed(6)} ` +
+          `(${pricePosition}% in range ${this.minPrice}-${this.maxPrice})`
         );
         this.lastLogTime = now;
       }
 
     } catch (error) {
       this.consecutiveErrors++;
-      logger.error(`❌ [${this.asset.symbol}] Update error: ${error.message}`);
+      logger.error(`[${this.asset.symbol}] Update error: ${error.message}`);
       
       if (this.consecutiveErrors >= this.MAX_ERRORS) {
-        logger.error(`❌ [${this.asset.symbol}] Critical errors, pausing...`);
+        logger.error(`[${this.asset.symbol}] Critical errors, pausing`);
         await new Promise(resolve => setTimeout(resolve, 5000));
         this.consecutiveErrors = 0;
       }
@@ -1030,7 +944,6 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
-    // ✅ Update with full precision
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     
@@ -1041,18 +954,9 @@ class AssetSimulator {
       this.maxPrice = settings.maxPrice;
     }
     
-    // ✅ Recalculate precision
-    this.priceRange = this.maxPrice - this.minPrice;
-    const exponent = Math.floor(Math.log10(this.priceRange));
-    this.decimalPlaces = Math.max(6, Math.abs(exponent) + 2);
-    
-    if (this.priceRange < 0.001) {
-      this.decimalPlaces = 10;
-    }
-    
     this.asset = newAsset;
     
-    logger.info(`🔄 [${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice} (${this.decimalPlaces} decimals)`);
+    logger.info(`[${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice}`);
   }
 
   getInfo() {
@@ -1062,12 +966,9 @@ class AssetSimulator {
       category: this.asset.category || 'normal',
       dataSource: this.asset.dataSource,
       currentPrice: this.currentPrice,
-      currentPriceFormatted: this.formatPrice(this.currentPrice),
       minPrice: this.minPrice,
       maxPrice: this.maxPrice,
-      priceRange: this.priceRange,
-      priceRangeExponential: this.priceRange.toExponential(),
-      decimalPlaces: this.decimalPlaces,
+      priceRange: this.maxPrice - this.minPrice,
       iteration: this.iteration,
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
@@ -1090,21 +991,21 @@ class MultiAssetManager {
   }
 
   async initialize() {
-    logger.info('🎯 Initializing Multi-Asset Manager (BINANCE-SYNCHRONIZED)...');
+    logger.info('Initializing Multi-Asset Manager');
     
     const assets = await this.firebase.getAssets();
     
     if (assets.length === 0) {
-      logger.error('❌ NO ACTIVE NORMAL ASSETS FOUND. Simulator shutting down (no auto-retry).');
-      logger.error('💡 To start simulator, add normal assets with category: "normal" and isActive: true');
-      logger.error('   Example dataSource: realtime_db, mock, or api');
+      logger.error('NO ACTIVE NORMAL ASSETS FOUND. Simulator shutting down');
+      logger.error('To start simulator, add normal assets with category: normal and isActive: true');
+      logger.error('Example dataSource: realtime_db, mock, or api');
       
       await this.stop();
       setTimeout(() => process.exit(0), 1000);
       return false;
     }
 
-    logger.info(`📊 Found ${assets.length} active normal assets (crypto excluded)`);
+    logger.info(`Found ${assets.length} active normal assets`);
     
     for (const asset of assets) {
       try {
@@ -1112,12 +1013,12 @@ class MultiAssetManager {
         await simulator.loadLastPrice();
         this.simulators.set(asset.id, simulator);
       } catch (error) {
-        logger.error(`❌ Failed to init ${asset.symbol}: ${error.message}`);
+        logger.error(`Failed to init ${asset.symbol}: ${error.message}`);
       }
     }
 
-    logger.info(`✅ ${this.simulators.size} simulators initialized`);
-    logger.info(`💎 Crypto assets: Backend Binance API (FREE)`);
+    logger.info(`${this.simulators.size} simulators initialized`);
+    logger.info('Crypto assets: Backend Binance API');
     return true;
   }
 
@@ -1132,21 +1033,21 @@ class MultiAssetManager {
       for (const id of currentIds) {
         if (!newIds.has(id)) {
           const simulator = this.simulators.get(id);
-          logger.info(`🗑️ Removing: ${simulator.asset.symbol}`);
+          logger.info(`Removing: ${simulator.asset.symbol}`);
           this.simulators.delete(id);
         }
       }
 
       for (const asset of assets) {
         if (!currentIds.has(asset.id)) {
-          logger.info(`➕ New asset: ${asset.symbol}`);
+          logger.info(`New asset: ${asset.symbol}`);
           
           try {
             const simulator = new AssetSimulator(asset, this.firebase);
             await simulator.loadLastPrice();
             this.simulators.set(asset.id, simulator);
           } catch (error) {
-            logger.error(`❌ Failed to add ${asset.symbol}: ${error.message}`);
+            logger.error(`Failed to add ${asset.symbol}: ${error.message}`);
           }
         } else {
           const simulator = this.simulators.get(asset.id);
@@ -1154,9 +1055,9 @@ class MultiAssetManager {
         }
       }
 
-      logger.debug(`🔄 Assets refreshed: ${this.simulators.size} active`);
+      logger.debug(`Assets refreshed: ${this.simulators.size} active`);
     } catch (error) {
-      logger.error(`❌ Refresh error: ${error.message}`);
+      logger.error(`Refresh error: ${error.message}`);
     }
   }
 
@@ -1176,16 +1077,16 @@ class MultiAssetManager {
       const stats = this.firebase.getStats();
       
       if (!stats.connection.isConnected) {
-        logger.warn('⚠️ Firebase disconnected, pausing updates...');
+        logger.warn('Firebase disconnected, pausing updates');
         this.isPaused = true;
       } else if (this.isPaused) {
-        logger.info('✅ Firebase reconnected, resuming updates...');
+        logger.info('Firebase reconnected, resuming updates');
         this.isPaused = false;
       }
       
       const timeSinceLastSuccess = Date.now() - this.firebase.writeStats.lastSuccessTime;
       if (timeSinceLastSuccess > 120000 && this.firebase.writeStats.success > 0) {
-        logger.warn(`⚠️ No successful writes in ${Math.floor(timeSinceLastSuccess / 1000)}s`);
+        logger.warn(`No successful writes in ${Math.floor(timeSinceLastSuccess / 1000)}s`);
       }
       
     }, 120000);
@@ -1193,14 +1094,14 @@ class MultiAssetManager {
 
   async start() {
     if (this.isRunning) {
-      logger.warn('⚠️ Manager already running');
+      logger.warn('Manager already running');
       return;
     }
 
     const initialized = await this.initialize();
     
     if (!initialized || this.simulators.size === 0) {
-      logger.error('❌ Failed to start simulators. Exiting (no auto-retry).');
+      logger.error('Failed to start simulators. Exiting');
       await this.stop();
       setTimeout(() => process.exit(1), 1000);
       return;
@@ -1209,24 +1110,17 @@ class MultiAssetManager {
     this.isRunning = true;
 
     logger.info('');
-    logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v15.0 - NO 1S TIMEFRAME');
-    logger.info('🚀 ================================================');
-    logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
-    logger.info('🚀 ✅ NO 1s OHLC (Reduced DB Writes)');
-    logger.info('🚀 ⚡ OHLC: 1m, 5m, 15m, 30m, 1h, 4h, 1d');
-    logger.info('🚀 ✅ PRICE RANGE: Correctly enforced from settings');
-    logger.info('🚀 💎 Crypto: Backend Binance API (FREE)');
-    logger.info('🚀 📊 Normal: This Simulator');
-    logger.info('🚀 ================================================');
-    logger.info(`🌐 Timezone: Asia/Jakarta (WIB = UTC+7)`);
-    logger.info(`⏰ Current: ${TimezoneUtil.formatDateTime()}`);
-    logger.info(`📊 Normal Assets: ${this.simulators.size}`);
-    logger.info('⏱️ Update: 1 second (1s trading)');
-    logger.info('🔄 Refresh: 10 minutes');
-    logger.info('💾 1s Retention: REMOVED (85% less writes)');
-    logger.info('🗑️ Cleanup: Every 2 hours');
-    logger.info('🚀 ================================================');
+    logger.info('MULTI-ASSET SIMULATOR v15.0');
+    logger.info('================================================');
+    logger.info(`Normal Assets: ${this.simulators.size}`);
+    logger.info(`Timezone: Asia/Jakarta (WIB = UTC+7)`);
+    logger.info(`Current: ${TimezoneUtil.formatDateTime()}`);
+    logger.info(`Update: 1 second`);
+    logger.info(`Refresh: 10 minutes`);
+    logger.info(`1s Retention: 60 bars (1 minute)`);
+    logger.info(`Cleanup: Every 2 hours`);
+    logger.info('================================================');
+    logger.info('');
 
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
@@ -1242,65 +1136,53 @@ class MultiAssetManager {
 
     this.startHealthCheck();
 
-    logger.info('✅ All systems running!');
-    logger.info('');
-    logger.info('💡 Division of Labor:');
-    logger.info('   • Normal assets: Simulated by THIS service');
-    logger.info('   • Crypto assets: Real-time from Backend Binance API (FREE)');
-    logger.info('   • Both types: Support 1-second trading');
-    logger.info('   • Backend writes OHLC for crypto (Binance)');
-    logger.info('   • Simulator writes OHLC for normal (WITHOUT 1s)');
-    logger.info('');
-    logger.info('⚠️  NO AUTO-RETRY: If no assets, simulator will EXIT');
-    logger.info('   To restart, add assets to Firestore then run: npm start');
-    logger.info('');
+    logger.info('All systems running');
   }
 
   logStats() {
     const stats = this.firebase.getStats();
     
+    let total1sBars = 0;
     const assetInfo = [];
     
     for (const sim of this.simulators.values()) {
+      total1sBars += sim.tfManager.barsCreated['1s'] || 0;
       assetInfo.push({
         symbol: sim.asset.symbol,
         price: sim.currentPrice.toFixed(6),
         range: `${sim.minPrice}-${sim.maxPrice}`,
-        position: ((sim.currentPrice - sim.minPrice) / (sim.maxPrice - sim.minPrice) * 100).toFixed(1)
+        position: ((sim.currentPrice - sim.minPrice) / (sim.maxPrice - sim.minPrice) * 100).toFixed(1),
+        bars1s: sim.tfManager.barsCreated['1s'] || 0
       });
     }
     
     logger.info('');
-    logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (NO 1S TIMEFRAME MODE)`);
-    logger.info(`📊 ================================================`);
-    logger.info(`   Normal Simulators: ${this.simulators.size}`);
-    logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
-    logger.info(`   Connection: ${stats.connection.isConnected ? '✅ OK' : '❌ DOWN'}`);
-    logger.info(`   Heartbeat: ${stats.connection.lastHeartbeat}`);
-    logger.info(`   Errors: ${stats.connection.consecutiveErrors}`);
-    logger.info('');
-    logger.info(`   ⚡ Update Rate: 1 second`);
+    logger.info(`STATUS REPORT (1s TIMEFRAME - 60 BAR RETENTION)`);
+    logger.info(`================================================`);
+    logger.info(`Normal Simulators: ${this.simulators.size}`);
+    logger.info(`Status: ${this.isPaused ? 'PAUSED' : 'RUNNING'}`);
+    logger.info(`Connection: ${stats.connection.isConnected ? 'OK' : 'DOWN'}`);
+    logger.info(`1s Bars Created: ${total1sBars}`);
     logger.info('');
     
     if (assetInfo.length > 0) {
-      logger.info(`   📈 Asset Prices:`);
+      logger.info(`Asset Prices & 1s Bars:`);
       assetInfo.forEach(a => {
-        logger.info(`      ${a.symbol}: ${a.price} (${a.position}% in ${a.range})`);
+        logger.info(`${a.symbol}: ${a.price} (${a.position}% in ${a.range}) | 1s: ${a.bars1s}`);
       });
       logger.info('');
     }
     
-    logger.info(`   Writes Success: ${stats.writes.success}`);
-    logger.info(`   Writes Failed: ${stats.writes.failed}`);
-    logger.info(`   Success Rate: ${stats.writes.successRate}%`);
-    logger.info(`   Queue Size: ${stats.writes.queued}`);
+    logger.info(`Writes Success: ${stats.writes.success}`);
+    logger.info(`Writes Failed: ${stats.writes.failed}`);
+    logger.info(`Success Rate: ${stats.writes.successRate}%`);
+    logger.info(`Queue Size: ${stats.writes.queued}`);
     logger.info('');
-    logger.info(`   💰 Firestore Reads: ${stats.billing.firestoreReads}`);
-    logger.info(`   💰 Est. Daily Reads: ${stats.billing.estimatedDailyReads}`);
-    logger.info(`   💰 Realtime Writes: ${stats.billing.realtimeWrites}`);
-    logger.info(`   💰 Est. Daily Writes: ${stats.billing.estimatedDailyWrites}`);
-    logger.info(`📊 ================================================`);
+    logger.info(`Firestore Reads: ${stats.billing.firestoreReads}`);
+    logger.info(`Est. Daily Reads: ${stats.billing.estimatedDailyReads}`);
+    logger.info(`Realtime Writes: ${stats.billing.realtimeWrites}`);
+    logger.info(`Est. Daily Writes: ${stats.billing.estimatedDailyWrites}`);
+    logger.info(`================================================`);
     logger.info('');
   }
 
@@ -1310,7 +1192,7 @@ class MultiAssetManager {
     this.isShuttingDown = true;
 
     logger.info('');
-    logger.info('🛑 Initiating graceful shutdown...');
+    logger.info('Initiating graceful shutdown');
     
     this.isRunning = false;
 
@@ -1319,12 +1201,12 @@ class MultiAssetManager {
     if (this.statsInterval) clearInterval(this.statsInterval);
     if (this.healthCheckInterval) clearInterval(this.healthCheckInterval);
 
-    logger.info('📊 Final Statistics:');
+    logger.info('Final Statistics:');
     this.logStats();
     
     await this.firebase.shutdown();
     
-    logger.info('✅ Graceful shutdown complete');
+    logger.info('Graceful shutdown complete');
     
     setTimeout(() => {
       process.exit(0);
@@ -1334,17 +1216,13 @@ class MultiAssetManager {
 
 async function main() {
   console.log('');
-  console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v15.0 - NO 1S TIMEFRAME');
-  console.log('🌐 ================================================');
-  console.log(`🌐 Process TZ: ${process.env.TZ}`);
-  console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
-  console.log('🌐 ⚡ 1-SECOND TRADING: ENABLED');
-  console.log('🌐 ✅ NO 1s OHLC (85% less DB writes)');
-  console.log('🌐 💎 CRYPTO: Backend Binance API (FREE)');
-  console.log('🌐 📊 NORMAL: This Simulator');
-  console.log('🌐 ❌ NO AUTO-RETRY: Will EXIT if no assets');
-  console.log('🌐 ================================================');
+  console.log('MULTI-ASSET SIMULATOR v16.0 - 1S TIMEFRAME ENABLED');
+  console.log(`Process TZ: ${process.env.TZ}`);
+  console.log(`Current Time: ${TimezoneUtil.formatDateTime()}`);
+  console.log('1-SECOND TRADING: ENABLED');
+  console.log('1s Retention: 60 bars (1 minute)');
+  console.log('Crypto: Backend Binance API');
+  console.log('Normal: This Simulator');
   console.log('');
 
   const firebaseManager = new FirebaseManager();
@@ -1359,14 +1237,12 @@ async function main() {
   process.on('SIGUSR2', shutdownHandler);
   
   process.on('uncaughtException', (error) => {
-    logger.error(`💥 Uncaught Exception: ${error.message}`);
+    logger.error(`Uncaught Exception: ${error.message}`);
     logger.error(error.stack);
-    logger.warn('⚠️ Attempting to continue after uncaught exception...');
   });
   
-  process.on('unhandledRejection', (reason, promise) => {
-    logger.error(`💥 Unhandled Rejection: ${reason}`);
-    logger.warn('⚠️ Continuing after unhandled rejection...');
+  process.on('unhandledRejection', (reason) => {
+    logger.error(`Unhandled Rejection: ${reason}`);
   });
   
   setInterval(() => {
@@ -1375,10 +1251,10 @@ async function main() {
     const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
     
     if (heapUsedMB > 300) {
-      logger.warn(`⚠️ High memory usage: ${heapUsedMB}MB / ${heapTotalMB}MB`);
+      logger.warn(`High memory usage: ${heapUsedMB}MB / ${heapTotalMB}MB`);
       
       if (global.gc) {
-        logger.info('🗑️ Running garbage collection...');
+        logger.info('Running garbage collection');
         global.gc();
       }
     }
@@ -1388,14 +1264,14 @@ async function main() {
     const initialized = await firebaseManager.initialize();
     
     if (!initialized) {
-      logger.error('❌ Firebase initialization failed');
+      logger.error('Firebase initialization failed');
       process.exit(1);
     }
     
     await manager.start();
     
   } catch (error) {
-    logger.error(`❌ Fatal error: ${error.message}`);
+    logger.error(`Fatal error: ${error.message}`);
     logger.error(error.stack);
     process.exit(1);
   }
