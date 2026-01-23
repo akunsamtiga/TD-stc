@@ -6,6 +6,8 @@
 # Script untuk menjalankan cleanup dengan PM2
 # ================================================================
 
+# chmod +x run-cleanup.sh && ./run-cleanup.sh
+
 set -e
 
 # Colors

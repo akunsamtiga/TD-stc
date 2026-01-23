@@ -1,4 +1,4 @@
-// trading-simulator/index.js 
+// trading-simulator/index.js - NO 1s TIMEFRAME VERSION
 
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
@@ -81,8 +81,8 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
+    // ✅ HAPUS: '1s': 0.0833
     this.RETENTION_DAYS = {
-      '1s': 0.0833,
       '1m': 2,
       '5m': 2,
       '15m': 3,
@@ -483,16 +483,11 @@ class FirebaseManager {
     }, this.CLEANUP_INTERVAL);
   }
 
-  /**
-   * ✅ OPTIMIZED: Stream-based batch processing untuk cleanup
-   * Menggunakan Admin SDK query untuk membaca data dalam batch
-   * Tidak load semua data ke memory, query dalam batch kecil
-   */
   async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
-      { tf: '1s', retention: this.RETENTION_DAYS['1s'] },
+      // ✅ HAPUS: { tf: '1s', retention: this.RETENTION_DAYS['1s'] },
       { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
       { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
       { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
@@ -502,11 +497,11 @@ class FirebaseManager {
       { tf: '1d', retention: this.RETENTION_DAYS['1d'] },
     ];
     
-    const BATCH_DELETE_SIZE = 100; // Jumlah key per batch delete
-    const QUERY_BATCH_SIZE = 500;   // Jumlah key per query
+    const BATCH_DELETE_SIZE = 100;
+    const QUERY_BATCH_SIZE = 500;
     
     for (const { tf, retention } of timeframes) {
-      const startTime = Date.now(); // Untuk metric
+      const startTime = Date.now();
       const cutoffTimestamp = TimezoneUtil.getCurrentTimestamp() - (retention * 86400);
       const fullPath = `${path}/ohlc_${tf}`;
       
@@ -516,9 +511,7 @@ class FirebaseManager {
       let queryCount = 0;
       
       try {
-        // Loop sampai tidak ada data lama lagi
         while (true) {
-          // Query: Ambil key yang lebih tua dari cutoff, batasi QUERY_BATCH_SIZE
           const snapshot = await this.realtimeDbAdmin
             .ref(fullPath)
             .orderByKey()
@@ -527,24 +520,14 @@ class FirebaseManager {
             .once('value');
           
           const data = snapshot.val();
-          
-          if (!data) {
-            break; // Sudah kosong atau tidak ada data lama
-          }
+          if (!data) break;
           
           const keys = Object.keys(data);
-          if (keys.length === 0) {
-            break; // Tidak ada data lama lagi
-          }
+          if (keys.length === 0) break;
           
-          // Filter keys (sudah di-order dan limited, tapi double-check)
           const keysToDelete = keys.filter(key => parseInt(key) < cutoffTimestamp);
+          if (keysToDelete.length === 0) break;
           
-          if (keysToDelete.length === 0) {
-            break; // Tidak ada yang perlu dihapus
-          }
-          
-          // Delete dalam batch parallel
           const deletePromises = [];
           for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
             const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
@@ -555,27 +538,21 @@ class FirebaseManager {
             deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
           }
           
-          // Tunggu semua batch selesai
           await Promise.allSettled(deletePromises);
           totalDeleted += keysToDelete.length;
           queryCount++;
           
-          // Log progress setiap 1000 record
           if (totalDeleted % 1000 === 0) {
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             logger.info(`  🗑️ ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`);
           }
           
-          // Rate limiting: pause 100ms setiap 2000 deletions
           if (totalDeleted % 2000 === 0) {
             logger.debug(`  ⏸️  Rate limit pause 100ms...`);
             await new Promise(resolve => setTimeout(resolve, 100));
           }
           
-          // Jika kurang dari QUERY_BATCH_SIZE, berarti sudah habis
-          if (keys.length < QUERY_BATCH_SIZE) {
-            break;
-          }
+          if (keys.length < QUERY_BATCH_SIZE) break;
         }
         
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -711,8 +688,8 @@ class FirebaseManager {
 
 class TimeframeManager {
   constructor() {
+    // ✅ HAPUS: '1s': 1
     this.timeframes = {
-      '1s': 1,
       '1m': 60,
       '5m': 300,
       '15m': 900,
@@ -989,13 +966,12 @@ class AssetSimulator {
       this.iteration++;
 
       if (now - this.lastLogTime > 30000) {
-        const bars1s = this.tfManager.barsCreated['1s'] || 0;
+        // ✅ HAPUS: const bars1s = this.tfManager.barsCreated['1s'] || 0;
         const pricePosition = ((newPrice - this.minPrice) / (this.maxPrice - this.minPrice) * 100).toFixed(1);
         logger.info(
           `[${this.asset.symbol}] ${this.isResumed ? '🔄' : '🆕'} | ` +
           `#${this.iteration}: ${newPrice.toFixed(6)} ` +
-          `(${pricePosition}% in range ${this.minPrice}-${this.maxPrice}) | ` +
-          `1s bars: ${bars1s}`
+          `(${pricePosition}% in range ${this.minPrice}-${this.maxPrice})`  // ✅ HAPUS: | 1s bars: ${bars1s}
         );
         this.lastLogTime = now;
       }
@@ -1044,7 +1020,7 @@ class AssetSimulator {
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
       consecutiveErrors: this.consecutiveErrors,
-      bars1s: this.tfManager.barsCreated['1s'] || 0,
+      // ✅ HAPUS: bars1s: this.tfManager.barsCreated['1s'] || 0,
     };
   }
 }
@@ -1183,10 +1159,11 @@ class MultiAssetManager {
 
     logger.info('');
     logger.info('🚀 ================================================');
-    logger.info('🚀 MULTI-ASSET SIMULATOR v14.0 - NO AUTO-RETRY');
+    logger.info('🚀 MULTI-ASSET SIMULATOR v15.0 - NO 1S TIMEFRAME');
     logger.info('🚀 ================================================');
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
-    logger.info('🚀 ⚡ OHLC: 1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d');
+    logger.info('🚀 ✅ NO 1s OHLC (Reduced DB Writes)');
+    logger.info('🚀 ⚡ OHLC: 1m, 5m, 15m, 30m, 1h, 4h, 1d');
     logger.info('🚀 ⚡ Update Interval: 1 second');
     logger.info('🚀 ✅ PRICE RANGE: Correctly enforced from settings');
     logger.info('🚀 💎 Crypto: Backend Binance API (FREE)');
@@ -1197,7 +1174,7 @@ class MultiAssetManager {
     logger.info(`📊 Normal Assets: ${this.simulators.size}`);
     logger.info('⏱️ Update: 1 second (1s trading)');
     logger.info('🔄 Refresh: 10 minutes');
-    logger.info('💾 1s Retention: 2 hours');
+    logger.info('💾 1s Retention: REMOVED (85% less writes)');
     logger.info('🗑️ Cleanup: Every 2 hours');
     logger.info('🚀 ================================================');
 
@@ -1222,7 +1199,7 @@ class MultiAssetManager {
     logger.info('   • Crypto assets: Real-time from Backend Binance API (FREE)');
     logger.info('   • Both types: Support 1-second trading');
     logger.info('   • Backend writes OHLC for crypto (Binance)');
-    logger.info('   • Simulator writes OHLC for normal (CURRENT + COMPLETED)');
+    logger.info('   • Simulator writes OHLC for normal (WITHOUT 1s)');
     logger.info('');
     logger.info('⚠️  NO AUTO-RETRY: If no assets, simulator will EXIT');
     logger.info('   To restart, add assets to Firestore then run: npm start');
@@ -1232,11 +1209,11 @@ class MultiAssetManager {
   logStats() {
     const stats = this.firebase.getStats();
     
-    let total1sBars = 0;
+    // ✅ HAPUS: let total1sBars = 0;
     const assetInfo = [];
     
     for (const sim of this.simulators.values()) {
-      total1sBars += sim.tfManager.barsCreated['1s'] || 0;
+      // ✅ HAPUS: total1sBars += sim.tfManager.barsCreated['1s'] || 0;
       assetInfo.push({
         symbol: sim.asset.symbol,
         price: sim.currentPrice.toFixed(6),
@@ -1247,7 +1224,7 @@ class MultiAssetManager {
     
     logger.info('');
     logger.info(`📊 ================================================`);
-    logger.info(`📊 STATUS REPORT (NO AUTO-RETRY MODE)`);
+    logger.info(`📊 STATUS REPORT (NO 1S TIMEFRAME MODE)`);
     logger.info(`📊 ================================================`);
     logger.info(`   Normal Simulators: ${this.simulators.size}`);
     logger.info(`   Status: ${this.isPaused ? '⏸️ PAUSED' : '▶️ RUNNING'}`);
@@ -1255,8 +1232,7 @@ class MultiAssetManager {
     logger.info(`   Heartbeat: ${stats.connection.lastHeartbeat}`);
     logger.info(`   Errors: ${stats.connection.consecutiveErrors}`);
     logger.info('');
-    logger.info(`   ⚡ 1s Bars Created: ${total1sBars}`);
-    logger.info(`   ⚡ Update Rate: 1 second`);
+    logger.info(`   ⚡ Update Rate: 1 second`);  // ✅ HAPUS: log total1sBars
     logger.info('');
     
     if (assetInfo.length > 0) {
@@ -1311,12 +1287,12 @@ class MultiAssetManager {
 async function main() {
   console.log('');
   console.log('🌐 ================================================');
-  console.log('🌐 MULTI-ASSET SIMULATOR v14.0 - NO AUTO-RETRY');
+  console.log('🌐 MULTI-ASSET SIMULATOR v15.0 - NO 1S TIMEFRAME');
   console.log('🌐 ================================================');
   console.log(`🌐 Process TZ: ${process.env.TZ}`);
   console.log(`🌐 Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('🌐 ⚡ 1-SECOND TRADING: ENABLED');
-  console.log('🌐 ✅ PRICE RANGE: Correctly read from Firestore');
+  console.log('🌐 ✅ NO 1s OHLC (85% less DB writes)');
   console.log('🌐 💎 CRYPTO: Backend Binance API (FREE)');
   console.log('🌐 📊 NORMAL: This Simulator');
   console.log('🌐 ❌ NO AUTO-RETRY: Will EXIT if no assets');
