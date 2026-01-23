@@ -1,5 +1,3 @@
-// trading-simulator/index.js - NO 1s TIMEFRAME VERSION
-
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -81,7 +79,6 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
-    // ✅ HAPUS: '1s': 0.0833
     this.RETENTION_DAYS = {
       '1m': 2,
       '5m': 2,
@@ -487,7 +484,6 @@ class FirebaseManager {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
-      // ✅ HAPUS: { tf: '1s', retention: this.RETENTION_DAYS['1s'] },
       { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
       { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
       { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
@@ -688,7 +684,6 @@ class FirebaseManager {
 
 class TimeframeManager {
   constructor() {
-    // ✅ HAPUS: '1s': 1
     this.timeframes = {
       '1m': 60,
       '5m': 300,
@@ -774,8 +769,10 @@ class AssetSimulator {
 
     const settings = asset.simulatorSettings || {};
     
+    // ✅ PRESERVE HIGH PRECISION - Don't use fallbacks that might lose precision
     this.initialPrice = settings.initialPrice || 40.022;
     
+    // ✅ Store original precision values
     if (settings.minPrice !== undefined && settings.minPrice !== null) {
       this.minPrice = settings.minPrice;
     } else {
@@ -789,8 +786,24 @@ class AssetSimulator {
     }
     
     this.currentPrice = this.initialPrice;
+    
+    // ✅ PRESERVE HIGH PRECISION volatility
     this.volatilityMin = settings.secondVolatilityMin || 0.00001;
     this.volatilityMax = settings.secondVolatilityMax || 0.00008;
+    
+    // ✅ Calculate precision needed based on price range
+    this.priceRange = this.maxPrice - this.minPrice;
+    
+    // Determine decimal places needed
+    // If range is 0.0009 (9e-4), we need at least 4 decimal places
+    // If range is 0.00000009 (9e-8), we need at least 8 decimal places
+    const exponent = Math.floor(Math.log10(this.priceRange));
+    this.decimalPlaces = Math.max(6, Math.abs(exponent) + 2); // At least 6, or more if needed
+    
+    // ✅ For very small ranges, use more precision
+    if (this.priceRange < 0.001) {
+      this.decimalPlaces = 10; // Maximum precision
+    }
     
     this.lastDirection = 1;
     this.iteration = 0;
@@ -809,12 +822,20 @@ class AssetSimulator {
     logger.info(`   Category: ${asset.category || 'normal'}`);
     logger.info(`   DataSource: ${asset.dataSource}`);
     logger.info(`   Path: ${this.realtimeDbPath}`);
-    logger.info(`   📊 SETTINGS:`);
+    logger.info(`   📊 SETTINGS (HIGH PRECISION):`);
     logger.info(`      Initial Price: ${this.initialPrice}`);
-    logger.info(`      Min Price: ${this.minPrice} ${settings.minPrice !== undefined ? '✓' : '(default)'}`);
-    logger.info(`      Max Price: ${this.maxPrice} ${settings.maxPrice !== undefined ? '✓' : '(default)'}`);
-    logger.info(`      Range Width: ${(this.maxPrice - this.minPrice).toFixed(2)}`);
-    logger.info(`      Volatility: ${this.volatilityMin} - ${this.volatilityMax}`);
+    logger.info(`      Min Price: ${this.minPrice} ${settings.minPrice !== undefined ? '✔' : '(default)'}`);
+    logger.info(`      Max Price: ${this.maxPrice} ${settings.maxPrice !== undefined ? '✔' : '(default)'}`);
+    logger.info(`      Range Width: ${this.priceRange.toExponential()} (${this.priceRange})`);
+    logger.info(`      Decimal Places: ${this.decimalPlaces}`);
+    logger.info(`      Volatility: ${this.volatilityMin.toExponential()} - ${this.volatilityMax.toExponential()}`);
+    
+    // ✅ Warn if volatility might cause issues
+    const maxChangePerUpdate = this.initialPrice * this.volatilityMax;
+    if (maxChangePerUpdate > this.priceRange) {
+      logger.warn(`      ⚠️  Max change (${maxChangePerUpdate.toExponential()}) > Range (${this.priceRange.toExponential()})`);
+      logger.warn(`      ⚠️  Price may hit boundaries frequently`);
+    }
   }
 
   async loadLastPrice() {
@@ -831,7 +852,7 @@ class AssetSimulator {
           this.lastPriceData = lastPriceData;
           this.isResumed = true;
           
-          logger.info(`🔄 [${this.asset.symbol}] RESUMED: ${price.toFixed(6)} (within ${this.minPrice}-${this.maxPrice})`);
+          logger.info(`🔄 [${this.asset.symbol}] RESUMED: ${price} (within ${this.minPrice}-${this.maxPrice})`);
           return true;
         } else {
           logger.warn(`⚠️ [${this.asset.symbol}] Last price ${price} outside range ${this.minPrice}-${this.maxPrice}, resetting to initial`);
@@ -846,6 +867,7 @@ class AssetSimulator {
     }
   }
 
+  // ✅ MODIFIED: High precision price movement
   generatePriceMovement() {
     const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
     
@@ -855,9 +877,11 @@ class AssetSimulator {
     }
     this.lastDirection = direction;
     
+    // ✅ HIGH PRECISION: Use full precision for calculation
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
+    // ✅ Enforce boundaries WITHOUT losing precision
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice;
       this.lastDirection = 1;
@@ -869,7 +893,17 @@ class AssetSimulator {
       logger.debug(`[${this.asset.symbol}] Hit max price ${this.maxPrice}, bouncing down`);
     }
     
+    // ✅ NO ROUNDING - Return full precision
     return newPrice;
+  }
+
+  // ✅ MODIFIED: Format price with appropriate precision
+  formatPrice(price) {
+    // For very small numbers, use exponential notation in logs but keep full precision in DB
+    if (this.priceRange < 0.0001) {
+      return price.toFixed(this.decimalPlaces);
+    }
+    return price.toFixed(Math.min(this.decimalPlaces, 10));
   }
 
   async updatePrice() {
@@ -890,13 +924,14 @@ class AssetSimulator {
       const date = new Date(timestamp * 1000);
       const dateTimeInfo = TimezoneUtil.getDateTimeInfo(date);
 
+      // ✅ STORE WITH FULL PRECISION - Don't round
       const currentPriceData = {
-        price: parseFloat(newPrice.toFixed(6)),
+        price: newPrice, // ✅ Store full precision
         timestamp: timestamp,
         datetime: dateTimeInfo.datetime,
         datetime_iso: dateTimeInfo.datetime_iso,
         timezone: 'Asia/Jakarta',
-        change: parseFloat(((newPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
+        change: (newPrice - this.initialPrice) / this.initialPrice * 100,
       };
       
       const writeSuccess = await this.firebase.setRealtimeValue(
@@ -916,6 +951,7 @@ class AssetSimulator {
         this.consecutiveErrors = 0;
       }
 
+      // ✅ OHLC bars with full precision
       for (const [tf, bar] of Object.entries(currentBars)) {
         const barDate = new Date(bar.timestamp * 1000);
         const barDateTime = TimezoneUtil.getDateTimeInfo(barDate);
@@ -925,10 +961,10 @@ class AssetSimulator {
           datetime: barDateTime.datetime,
           datetime_iso: barDateTime.datetime_iso,
           timezone: 'Asia/Jakarta',
-          open: parseFloat(bar.open.toFixed(6)),
-          high: parseFloat(bar.high.toFixed(6)),
-          low: parseFloat(bar.low.toFixed(6)),
-          close: parseFloat(bar.close.toFixed(6)),
+          open: bar.open,     // ✅ Full precision
+          high: bar.high,     // ✅ Full precision
+          low: bar.low,       // ✅ Full precision
+          close: bar.close,   // ✅ Full precision
           volume: bar.volume,
           isCompleted: false
         };
@@ -948,10 +984,10 @@ class AssetSimulator {
           datetime: barDateTime.datetime,
           datetime_iso: barDateTime.datetime_iso,
           timezone: 'Asia/Jakarta',
-          open: parseFloat(bar.open.toFixed(6)),
-          high: parseFloat(bar.high.toFixed(6)),
-          low: parseFloat(bar.low.toFixed(6)),
-          close: parseFloat(bar.close.toFixed(6)),
+          open: bar.open,     // ✅ Full precision
+          high: bar.high,     // ✅ Full precision
+          low: bar.low,       // ✅ Full precision
+          close: bar.close,   // ✅ Full precision
           volume: bar.volume,
           isCompleted: true
         };
@@ -965,13 +1001,16 @@ class AssetSimulator {
       this.currentPrice = newPrice;
       this.iteration++;
 
+      // ✅ Log with appropriate precision
       if (now - this.lastLogTime > 30000) {
-        // ✅ HAPUS: const bars1s = this.tfManager.barsCreated['1s'] || 0;
-        const pricePosition = ((newPrice - this.minPrice) / (this.maxPrice - this.minPrice) * 100).toFixed(1);
+        const pricePosition = ((newPrice - this.minPrice) / this.priceRange * 100).toFixed(2);
+        const priceDisplay = this.formatPrice(newPrice);
+        const rangeDisplay = `${this.formatPrice(this.minPrice)}-${this.formatPrice(this.maxPrice)}`;
+        
         logger.info(
           `[${this.asset.symbol}] ${this.isResumed ? '🔄' : '🆕'} | ` +
-          `#${this.iteration}: ${newPrice.toFixed(6)} ` +
-          `(${pricePosition}% in range ${this.minPrice}-${this.maxPrice})`  // ✅ HAPUS: | 1s bars: ${bars1s}
+          `#${this.iteration}: ${priceDisplay} ` +
+          `(${pricePosition}% in ${rangeDisplay})`
         );
         this.lastLogTime = now;
       }
@@ -991,6 +1030,7 @@ class AssetSimulator {
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
     
+    // ✅ Update with full precision
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     
@@ -1001,9 +1041,18 @@ class AssetSimulator {
       this.maxPrice = settings.maxPrice;
     }
     
+    // ✅ Recalculate precision
+    this.priceRange = this.maxPrice - this.minPrice;
+    const exponent = Math.floor(Math.log10(this.priceRange));
+    this.decimalPlaces = Math.max(6, Math.abs(exponent) + 2);
+    
+    if (this.priceRange < 0.001) {
+      this.decimalPlaces = 10;
+    }
+    
     this.asset = newAsset;
     
-    logger.info(`🔄 [${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice}`);
+    logger.info(`🔄 [${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice} (${this.decimalPlaces} decimals)`);
   }
 
   getInfo() {
@@ -1013,14 +1062,16 @@ class AssetSimulator {
       category: this.asset.category || 'normal',
       dataSource: this.asset.dataSource,
       currentPrice: this.currentPrice,
+      currentPriceFormatted: this.formatPrice(this.currentPrice),
       minPrice: this.minPrice,
       maxPrice: this.maxPrice,
-      priceRange: this.maxPrice - this.minPrice,
+      priceRange: this.priceRange,
+      priceRangeExponential: this.priceRange.toExponential(),
+      decimalPlaces: this.decimalPlaces,
       iteration: this.iteration,
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
       consecutiveErrors: this.consecutiveErrors,
-      // ✅ HAPUS: bars1s: this.tfManager.barsCreated['1s'] || 0,
     };
   }
 }
@@ -1164,7 +1215,6 @@ class MultiAssetManager {
     logger.info('🚀 ⚡ 1-SECOND TRADING ENABLED');
     logger.info('🚀 ✅ NO 1s OHLC (Reduced DB Writes)');
     logger.info('🚀 ⚡ OHLC: 1m, 5m, 15m, 30m, 1h, 4h, 1d');
-    logger.info('🚀 ⚡ Update Interval: 1 second');
     logger.info('🚀 ✅ PRICE RANGE: Correctly enforced from settings');
     logger.info('🚀 💎 Crypto: Backend Binance API (FREE)');
     logger.info('🚀 📊 Normal: This Simulator');
@@ -1209,11 +1259,9 @@ class MultiAssetManager {
   logStats() {
     const stats = this.firebase.getStats();
     
-    // ✅ HAPUS: let total1sBars = 0;
     const assetInfo = [];
     
     for (const sim of this.simulators.values()) {
-      // ✅ HAPUS: total1sBars += sim.tfManager.barsCreated['1s'] || 0;
       assetInfo.push({
         symbol: sim.asset.symbol,
         price: sim.currentPrice.toFixed(6),
@@ -1232,7 +1280,7 @@ class MultiAssetManager {
     logger.info(`   Heartbeat: ${stats.connection.lastHeartbeat}`);
     logger.info(`   Errors: ${stats.connection.consecutiveErrors}`);
     logger.info('');
-    logger.info(`   ⚡ Update Rate: 1 second`);  // ✅ HAPUS: log total1sBars
+    logger.info(`   ⚡ Update Rate: 1 second`);
     logger.info('');
     
     if (assetInfo.length > 0) {
