@@ -92,7 +92,7 @@ class FirebaseManager {
     };
     
     this.lastCleanupTime = 0;
-    this.CLEANUP_INTERVAL = 7200000;
+    this.CLEANUP_INTERVAL = 60000;
     this.firestoreReadCount = 0;
     this.realtimeWriteCount = 0;
     this.lastReadReset = Date.now();
