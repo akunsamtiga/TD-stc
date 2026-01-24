@@ -1,3 +1,4 @@
+// trading-simulator/index.js
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -429,111 +430,116 @@ class FirebaseManager {
   }
 
   async cleanupAsset(asset) {
-    const path = this.getAssetPath(asset);
+  const path = this.getAssetPath(asset);
+  
+  const timeframes = [
+    { tf: '1s', retention: this.RETENTION_DAYS['1s'], isSeconds: true },
+    { tf: '1m', retention: this.RETENTION_DAYS['1m'], isSeconds: false },
+    { tf: '5m', retention: this.RETENTION_DAYS['5m'], isSeconds: false },
+    { tf: '15m', retention: this.RETENTION_DAYS['15m'], isSeconds: false },
+    { tf: '30m', retention: this.RETENTION_DAYS['30m'], isSeconds: false },
+    { tf: '1h', retention: this.RETENTION_DAYS['1h'], isSeconds: false },
+    { tf: '4h', retention: this.RETENTION_DAYS['4h'], isSeconds: false },
+    { tf: '1d', retention: this.RETENTION_DAYS['1d'], isSeconds: false },
+  ];
+  
+  const BATCH_DELETE_SIZE = 100;
+  const QUERY_BATCH_SIZE = 500;
+  const MAX_1S_BARS = 60;
+  
+  for (const { tf, retention, isSeconds } of timeframes) {
+    const startTime = Date.now();
+    const now = TimezoneUtil.getCurrentTimestamp();
+    const cutoffTimestamp = isSeconds ? now - 60 : now - (retention * 86400);
+    const fullPath = `${path}/ohlc_${tf}`;
     
-    const timeframes = [
-      { tf: '1s', retention: this.RETENTION_DAYS['1s'], isSeconds: true },
-      { tf: '1m', retention: this.RETENTION_DAYS['1m'], isSeconds: false },
-      { tf: '5m', retention: this.RETENTION_DAYS['5m'], isSeconds: false },
-      { tf: '15m', retention: this.RETENTION_DAYS['15m'], isSeconds: false },
-      { tf: '30m', retention: this.RETENTION_DAYS['30m'], isSeconds: false },
-      { tf: '1h', retention: this.RETENTION_DAYS['1h'], isSeconds: false },
-      { tf: '4h', retention: this.RETENTION_DAYS['4h'], isSeconds: false },
-      { tf: '1d', retention: this.RETENTION_DAYS['1d'], isSeconds: false },
-    ];
+    logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (cutoff: ${cutoffTimestamp})`);
     
-    const BATCH_DELETE_SIZE = 100;
-    const QUERY_BATCH_SIZE = 500;
-    const MAX_1S_BARS = 60;
+    let totalDeleted = 0;
+    let queryCount = 0;
     
-    for (const { tf, retention, isSeconds } of timeframes) {
-      const startTime = Date.now();
-      const now = TimezoneUtil.getCurrentTimestamp();
-      const cutoffTimestamp = isSeconds ? now - 60 : now - (retention * 86400);
-      const fullPath = `${path}/ohlc_${tf}`;
-      
-      logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (cutoff: ${cutoffTimestamp})`);
-      
-      let totalDeleted = 0;
-      let queryCount = 0;
-      
-      try {
-        while (true) {
-          const snapshot = await this.realtimeDbAdmin
-            .ref(fullPath)
-            .orderByKey()
-            .endAt(String(tf === '1s' ? now : cutoffTimestamp))
-            .limitToFirst(QUERY_BATCH_SIZE)
-            .once('value');
-          
-          const data = snapshot.val();
-          if (!data) break;
-          
-          const keys = Object.keys(data);
-          if (keys.length === 0) break;
-          
-          if (tf === '1s') {
-            if (keys.length > MAX_1S_BARS) {
-              const excessCount = keys.length - MAX_1S_BARS;
-              const keysToDelete = keys.slice(0, excessCount);
-              const deletePromises = [];
-              
-              for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
-                const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
-                const updates = {};
-                batch.forEach(key => {
-                  updates[`${fullPath}/${key}`] = null;
-                });
-                deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
-              }
-              
-              await Promise.allSettled(deletePromises);
-              totalDeleted += keysToDelete.length;
-            }
-          } else {
-            const keysToDelete = keys.filter(key => parseInt(key) < cutoffTimestamp);
-            if (keysToDelete.length === 0) break;
-            
-            const deletePromises = [];
-            for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
-              const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
-              const updates = {};
-              batch.forEach(key => {
-                updates[`${fullPath}/${key}`] = null;
-              });
-              deletePromises.push(this.realtimeDbAdmin.ref().update(updates));
-            }
-            
-            await Promise.allSettled(deletePromises);
-            totalDeleted += keysToDelete.length;
-          }
-          
-          queryCount++;
-          
-          if (totalDeleted % 1000 === 0) {
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            logger.info(`${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`);
-          }
-          
-          if (queryCount % 20 === 0) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-          }
-          
-          if (Object.keys(data).length < QUERY_BATCH_SIZE) break;
-        }
+    try {
+      while (true) {
+        const snapshot = await this.realtimeDbAdmin
+          .ref(fullPath)
+          .orderByKey()
+          .limitToFirst(QUERY_BATCH_SIZE)
+          .once('value');
         
-        const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-        if (totalDeleted > 0) {
-          logger.info(`Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars in ${totalTime}s`);
+        const data = snapshot.val();
+        if (!data) break;
+        
+        const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
+        if (allKeys.length === 0) break;
+        
+        let keysToDelete = [];
+        
+        if (tf === '1s') {
+          // ✅ TWO-PHASE CLEANUP for 1s
+          // Phase 1: Time-based (older than 1 minute)
+          const oldKeys = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
+          keysToDelete.push(...oldKeys);
+          
+          // Phase 2: Count-based (keep only 60 newest)
+          const remaining = allKeys.filter(key => !keysToDelete.includes(key));
+          if (remaining.length > MAX_1S_BARS) {
+            const excessCount = remaining.length - MAX_1S_BARS;
+            const oldestRemaining = remaining.slice(0, excessCount);
+            keysToDelete.push(...oldestRemaining);
+          }
         } else {
-          logger.debug(`Cleanup ${asset.symbol} ${tf}: No old data (${totalTime}s)`);
+          // Regular time-based cleanup for other timeframes
+          keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
         }
         
-      } catch (error) {
-        logger.error(`Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
+        if (keysToDelete.length === 0) break;
+        
+        // ✅ BATCH DELETE with relative paths
+        const deletePromises = [];
+        for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
+          const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
+          const updates = {};
+          batch.forEach(key => {
+            updates[key] = null; // Relative path
+          });
+          deletePromises.push(
+            this.realtimeDbAdmin.ref(fullPath).update(updates)
+          );
+        }
+        
+        await Promise.allSettled(deletePromises);
+        totalDeleted += keysToDelete.length;
+        
+        queryCount++;
+        
+        if (totalDeleted % 1000 === 0) {
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          logger.info(
+            `${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`
+          );
+        }
+        
+        if (queryCount % 20 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+        if (Object.keys(data).length < QUERY_BATCH_SIZE) break;
       }
+      
+      const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+      if (totalDeleted > 0) {
+        logger.info(
+          `Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars in ${totalTime}s`
+        );
+      } else {
+        logger.debug(`Cleanup ${asset.symbol} ${tf}: No old data (${totalTime}s)`);
+      }
+      
+    } catch (error) {
+      logger.error(`Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
     }
   }
+}
 
   getAssetPath(asset) {
     if (asset.dataSource === 'realtime_db') {
