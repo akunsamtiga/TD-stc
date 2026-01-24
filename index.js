@@ -82,13 +82,13 @@ class FirebaseManager {
     
     this.RETENTION_DAYS = {
       '1s': 0.000694,
-      '1m': 2,
-      '5m': 2,
-      '15m': 3,
-      '30m': 4,
-      '1h': 5,
-      '4h': 7,
-      '1d': 14,
+      '1m': 0.0417,      // 1 jam 
+      '5m': 0.125,       // 3 jam
+      '15m': 0.25,       // 6 jam
+      '30m': 0.5,        // 12 jam
+      '1h': 1,           // 1 hari
+      '4h': 3,           // 3 hari
+      '1d': 7,           // 7 hari
     };
     
     this.lastCleanupTime = 0;
