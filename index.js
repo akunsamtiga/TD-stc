@@ -649,14 +649,14 @@ class FirebaseManager {
 class TimeframeManager {
   constructor() {
     this.timeframes = {
-      '1s': 2,      // 1 detik → 2 detik
-      '1m': 120,    // 1 menit → 2 menit  
-      '5m': 600,    // 5 menit → 10 menit
-      '15m': 1800,  // 15 menit → 30 menit
-      '30m': 3600,  // 30 menit → 1 jam
-      '1h': 7200,   // 1 jam → 2 jam
-      '4h': 28800,  // 4 jam → 8 jam
-      '1d': 172800, // 1 hari → 2 hari
+      '1s': 1,      
+      '1m': 60,    
+      '5m': 300,    
+      '15m': 900,  
+      '30m': 1800,  
+      '1h': 3600,   
+      '4h': 14400, 
+      '1d': 86400, 
     };
 
     this.bars = {};
