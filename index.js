@@ -80,15 +80,16 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
+    // ✅ FIXED: Retention sekarang yang menentukan, BUKAN max bars
     this.RETENTION_DAYS = {
-      '1s': 0.001388,   // 2 menit (was 1 menit)
-      '1m': 0.0834,     // 2 jam (was 1 jam)
-      '5m': 0.25,       // 6 jam (was 3 jam)
-      '15m': 0.5,       // 12 jam (was 6 jam)
-      '30m': 1,         // 1 hari (was 12 jam)
-      '1h': 2,          // 2 hari (was 1 hari)
-      '4h': 6,          // 6 hari (was 3 hari)
-      '1d': 14,         // 14 hari (was 7 hari)
+      '1s': 0.001388,   // 2 menit = 120 bars
+      '1m': 0.0834,     // 2 jam
+      '5m': 0.25,       // 6 jam
+      '15m': 0.5,       // 12 jam
+      '30m': 1,         // 1 hari
+      '1h': 2,          // 2 hari
+      '4h': 6,          // 6 hari
+      '1d': 14,         // 14 hari
     };
     
     this.lastCleanupTime = 0;
@@ -430,116 +431,115 @@ class FirebaseManager {
   }
 
   async cleanupAsset(asset) {
-  const path = this.getAssetPath(asset);
-  
-  const timeframes = [
-    { tf: '1s', retention: this.RETENTION_DAYS['1s'], isSeconds: true },
-    { tf: '1m', retention: this.RETENTION_DAYS['1m'], isSeconds: false },
-    { tf: '5m', retention: this.RETENTION_DAYS['5m'], isSeconds: false },
-    { tf: '15m', retention: this.RETENTION_DAYS['15m'], isSeconds: false },
-    { tf: '30m', retention: this.RETENTION_DAYS['30m'], isSeconds: false },
-    { tf: '1h', retention: this.RETENTION_DAYS['1h'], isSeconds: false },
-    { tf: '4h', retention: this.RETENTION_DAYS['4h'], isSeconds: false },
-    { tf: '1d', retention: this.RETENTION_DAYS['1d'], isSeconds: false },
-  ];
-  
-  const BATCH_DELETE_SIZE = 100;
-  const QUERY_BATCH_SIZE = 500;
-  const MAX_1S_BARS = 60;
-  
-  for (const { tf, retention, isSeconds } of timeframes) {
-    const startTime = Date.now();
-    const now = TimezoneUtil.getCurrentTimestamp();
-    const cutoffTimestamp = isSeconds ? now - 60 : now - (retention * 86400);
-    const fullPath = `${path}/ohlc_${tf}`;
+    const path = this.getAssetPath(asset);
     
-    logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (cutoff: ${cutoffTimestamp})`);
+    const timeframes = [
+      { tf: '1s', retention: this.RETENTION_DAYS['1s'] },
+      { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
+      { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
+      { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
+      { tf: '30m', retention: this.RETENTION_DAYS['30m'] },
+      { tf: '1h', retention: this.RETENTION_DAYS['1h'] },
+      { tf: '4h', retention: this.RETENTION_DAYS['4h'] },
+      { tf: '1d', retention: this.RETENTION_DAYS['1d'] },
+    ];
     
-    let totalDeleted = 0;
-    let queryCount = 0;
+    const BATCH_DELETE_SIZE = 100;
+    const QUERY_BATCH_SIZE = 500;
     
-    try {
-      while (true) {
-        const snapshot = await this.realtimeDbAdmin
-          .ref(fullPath)
-          .orderByKey()
-          .limitToFirst(QUERY_BATCH_SIZE)
-          .once('value');
-        
-        const data = snapshot.val();
-        if (!data) break;
-        
-        const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
-        if (allKeys.length === 0) break;
-        
-        let keysToDelete = [];
-        
-        if (tf === '1s') {
-          // ✅ TWO-PHASE CLEANUP for 1s
-          // Phase 1: Time-based (older than 1 minute)
-          const oldKeys = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
-          keysToDelete.push(...oldKeys);
+    for (const { tf, retention } of timeframes) {
+      const startTime = Date.now();
+      const now = TimezoneUtil.getCurrentTimestamp();
+      
+      // ✅ FIXED: Convert retention days to seconds
+      const retentionSeconds = Math.floor(retention * 86400);
+      const cutoffTimestamp = now - retentionSeconds;
+      const fullPath = `${path}/ohlc_${tf}`;
+      
+      logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (retention: ${retentionSeconds}s, cutoff: ${cutoffTimestamp})`);
+      
+      let totalDeleted = 0;
+      let queryCount = 0;
+      
+      try {
+        while (true) {
+          const snapshot = await this.realtimeDbAdmin
+            .ref(fullPath)
+            .orderByKey()
+            .limitToFirst(QUERY_BATCH_SIZE)
+            .once('value');
           
-          // Phase 2: Count-based (keep only 60 newest)
-          const remaining = allKeys.filter(key => !keysToDelete.includes(key));
-          if (remaining.length > MAX_1S_BARS) {
-            const excessCount = remaining.length - MAX_1S_BARS;
-            const oldestRemaining = remaining.slice(0, excessCount);
-            keysToDelete.push(...oldestRemaining);
+          const data = snapshot.val();
+          if (!data) break;
+          
+          const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
+          if (allKeys.length === 0) break;
+          
+          // ✅ FIXED: HANYA time-based cleanup, TIDAK ADA max bars limit!
+          const keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
+          
+          if (keysToDelete.length === 0) break;
+          
+          // ✅ Batch delete with relative paths
+          const deletePromises = [];
+          for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
+            const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
+            const updates = {};
+            batch.forEach(key => {
+              updates[key] = null;
+            });
+            deletePromises.push(
+              this.realtimeDbAdmin.ref(fullPath).update(updates)
+            );
           }
-        } else {
-          // Regular time-based cleanup for other timeframes
-          keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
+          
+          await Promise.allSettled(deletePromises);
+          totalDeleted += keysToDelete.length;
+          
+          queryCount++;
+          
+          if (totalDeleted % 1000 === 0) {
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            logger.info(
+              `${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`
+            );
+          }
+          
+          if (queryCount % 20 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          
+          if (Object.keys(data).length < QUERY_BATCH_SIZE) break;
         }
         
-        if (keysToDelete.length === 0) break;
+        const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         
-        // ✅ BATCH DELETE with relative paths
-        const deletePromises = [];
-        for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
-          const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
-          const updates = {};
-          batch.forEach(key => {
-            updates[key] = null; // Relative path
-          });
-          deletePromises.push(
-            this.realtimeDbAdmin.ref(fullPath).update(updates)
-          );
-        }
+        // ✅ Calculate expected bars untuk info
+        const expectedBars = tf === '1s' ? 120 : 
+                           tf === '1m' ? 120 :
+                           tf === '5m' ? 72 :
+                           tf === '15m' ? 48 :
+                           tf === '30m' ? 48 :
+                           tf === '1h' ? 48 :
+                           tf === '4h' ? 36 : 14;
         
-        await Promise.allSettled(deletePromises);
-        totalDeleted += keysToDelete.length;
-        
-        queryCount++;
-        
-        if (totalDeleted % 1000 === 0) {
-          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        if (totalDeleted > 0) {
           logger.info(
-            `${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`
+            `Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted ` +
+            `(retention: ${retentionSeconds}s = ~${expectedBars} bars) in ${totalTime}s`
+          );
+        } else {
+          logger.debug(
+            `Cleanup ${asset.symbol} ${tf}: No old data ` +
+            `(retention: ${retentionSeconds}s = ~${expectedBars} bars, ${totalTime}s)`
           );
         }
         
-        if (queryCount % 20 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-        
-        if (Object.keys(data).length < QUERY_BATCH_SIZE) break;
+      } catch (error) {
+        logger.error(`Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
       }
-      
-      const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-      if (totalDeleted > 0) {
-        logger.info(
-          `Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars in ${totalTime}s`
-        );
-      } else {
-        logger.debug(`Cleanup ${asset.symbol} ${tf}: No old data (${totalTime}s)`);
-      }
-      
-    } catch (error) {
-      logger.error(`Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
     }
   }
-}
 
   getAssetPath(asset) {
     if (asset.dataSource === 'realtime_db') {
@@ -1116,15 +1116,15 @@ class MultiAssetManager {
     this.isRunning = true;
 
     logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v15.0');
+    logger.info('MULTI-ASSET SIMULATOR v17.0 - TIME-BASED CLEANUP ONLY');
     logger.info('================================================');
     logger.info(`Normal Assets: ${this.simulators.size}`);
     logger.info(`Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`Current: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`Update: 1 second`);
     logger.info(`Refresh: 10 minutes`);
-    logger.info(`1s Retention: 60 bars (1 minute)`);
-    logger.info(`Cleanup: Every 2 hours`);
+    logger.info(`1s Retention: 2 minutes (120 bars) ✅ NO MAX LIMIT`);
+    logger.info(`Cleanup: Every 1 minute (time-based only)`);
     logger.info('================================================');
     logger.info('');
 
@@ -1163,12 +1163,13 @@ class MultiAssetManager {
     }
     
     logger.info('');
-    logger.info(`STATUS REPORT (1s TIMEFRAME - 60 BAR RETENTION)`);
+    logger.info(`STATUS REPORT (TIME-BASED CLEANUP - NO MAX BARS LIMIT)`);
     logger.info(`================================================`);
     logger.info(`Normal Simulators: ${this.simulators.size}`);
     logger.info(`Status: ${this.isPaused ? 'PAUSED' : 'RUNNING'}`);
     logger.info(`Connection: ${stats.connection.isConnected ? 'OK' : 'DOWN'}`);
     logger.info(`1s Bars Created: ${total1sBars}`);
+    logger.info(`1s Retention: 2 minutes (120 bars) - Time-based only ✅`);
     logger.info('');
     
     if (assetInfo.length > 0) {
@@ -1222,11 +1223,12 @@ class MultiAssetManager {
 
 async function main() {
   console.log('');
-  console.log('MULTI-ASSET SIMULATOR v16.0 - 1S TIMEFRAME ENABLED');
+  console.log('MULTI-ASSET SIMULATOR v17.0 - TIME-BASED CLEANUP ONLY');
   console.log(`Process TZ: ${process.env.TZ}`);
   console.log(`Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('1-SECOND TRADING: ENABLED');
-  console.log('1s Retention: 60 bars (1 minute)');
+  console.log('1s Retention: 2 minutes (120 bars) ✅ NO MAX LIMIT');
+  console.log('Cleanup: Time-based ONLY, NO count limit');
   console.log('Crypto: Backend Binance API');
   console.log('Normal: This Simulator');
   console.log('');
