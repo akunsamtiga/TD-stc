@@ -82,14 +82,14 @@ class FirebaseManager {
     
     // ✅ FIXED: Retention sekarang yang menentukan, BUKAN max bars
     this.RETENTION_DAYS = {
-      '1s': 0.001388,   // 2 menit = 120 bars
-      '1m': 0.0834,     // 2 jam
-      '5m': 0.25,       // 6 jam
-      '15m': 0.5,       // 12 jam
-      '30m': 1,         // 1 hari
-      '1h': 2,          // 2 hari
-      '4h': 6,          // 6 hari
-      '1d': 14,         // 14 hari
+      '1s': 0.002778,     // 240 candles (4 menit)
+      '1m': 0.166667,     // 240 candles (4 jam)
+      '5m': 0.833333,     // 240 candles (20 jam)
+      '15m': 2.5,        // 240 candles (2.5 hari)
+      '30m': 5,          // 240 candles (5 hari)
+      '1h': 10,          // 240 candles (10 hari)
+      '4h': 40,          // 240 candles (40 hari)
+      '1d': 240,         // 240 candles (240 hari)
     };
     
     this.lastCleanupTime = 0;
@@ -515,13 +515,7 @@ class FirebaseManager {
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         
         // ✅ Calculate expected bars untuk info
-        const expectedBars = tf === '1s' ? 120 : 
-                           tf === '1m' ? 120 :
-                           tf === '5m' ? 72 :
-                           tf === '15m' ? 48 :
-                           tf === '30m' ? 48 :
-                           tf === '1h' ? 48 :
-                           tf === '4h' ? 36 : 14;
+        const expectedBars = 240;
         
         if (totalDeleted > 0) {
           logger.info(
@@ -1123,7 +1117,7 @@ class MultiAssetManager {
     logger.info(`Current: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`Update: 1 second`);
     logger.info(`Refresh: 10 minutes`);
-    logger.info(`1s Retention: 2 minutes (120 bars) ✅ NO MAX LIMIT`);
+    logger.info(`1s Retention: 4 minutes (240 bars) ✅ NO MAX LIMIT`);
     logger.info(`Cleanup: Every 1 minute (time-based only)`);
     logger.info('================================================');
     logger.info('');
@@ -1169,7 +1163,7 @@ class MultiAssetManager {
     logger.info(`Status: ${this.isPaused ? 'PAUSED' : 'RUNNING'}`);
     logger.info(`Connection: ${stats.connection.isConnected ? 'OK' : 'DOWN'}`);
     logger.info(`1s Bars Created: ${total1sBars}`);
-    logger.info(`1s Retention: 2 minutes (120 bars) - Time-based only ✅`);
+    logger.info(`1s Retention: 4 minutes (240 bars) - Time-based only ✅`);
     logger.info('');
     
     if (assetInfo.length > 0) {
@@ -1227,7 +1221,7 @@ async function main() {
   console.log(`Process TZ: ${process.env.TZ}`);
   console.log(`Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('1-SECOND TRADING: ENABLED');
-  console.log('1s Retention: 2 minutes (120 bars) ✅ NO MAX LIMIT');
+  console.log('1s Retention: 4 minutes (240 bars) ✅ NO MAX LIMIT');
   console.log('Cleanup: Time-based ONLY, NO count limit');
   console.log('Crypto: Backend Binance API');
   console.log('Normal: This Simulator');
