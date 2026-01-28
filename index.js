@@ -81,14 +81,14 @@ class FirebaseManager {
     };
     
     this.RETENTION_DAYS = {
-      '1s': 0.000694,
-      '1m': 0.0417,      // 1 jam 
-      '5m': 0.125,       // 3 jam
-      '15m': 0.25,       // 6 jam
-      '30m': 0.5,        // 12 jam
-      '1h': 1,           // 1 hari
-      '4h': 3,           // 3 hari
-      '1d': 7,           // 7 hari
+      '1s': 0.001388,   // 2 menit (was 1 menit)
+      '1m': 0.0834,     // 2 jam (was 1 jam)
+      '5m': 0.25,       // 6 jam (was 3 jam)
+      '15m': 0.5,       // 12 jam (was 6 jam)
+      '30m': 1,         // 1 hari (was 12 jam)
+      '1h': 2,          // 2 hari (was 1 hari)
+      '4h': 6,          // 6 hari (was 3 hari)
+      '1d': 14,         // 14 hari (was 7 hari)
     };
     
     this.lastCleanupTime = 0;
