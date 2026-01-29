@@ -1144,18 +1144,19 @@ async initializeCandlesForAsset(asset, simulator) {
   const initialPrice = simulator.initialPrice;
   
   // ✅ ENHANCED: Gunakan volatilitas 50x untuk generating candle历史
-  const VOLATILITY_MULTIPLIER = 50; // Ubah dari 100 menjadi 50
+  const VOLATILITY_MULTIPLIER = 50;
   
   const originalVolatilityMax = simulator.volatilityMax;
   const originalVolatilityMin = simulator.volatilityMin;
   
-  // Kalikan dengan 50 untuk initialization
+  // Kalikan dengan 50 untuk initialization (hanya untuk generate candle, bukan untuk simulasi berjalan)
   const volatilityMax = originalVolatilityMax * VOLATILITY_MULTIPLIER;
   const volatilityMin = originalVolatilityMin * VOLATILITY_MULTIPLIER;
   
   logger.info(`[${asset.symbol}] Initializing 240 candles with ${VOLATILITY_MULTIPLIER}x volatility:`);
   logger.info(`[${asset.symbol}]   Original: ${originalVolatilityMin} - ${originalVolatilityMax}`);
   logger.info(`[${asset.symbol}]   Used: ${volatilityMin} - ${volatilityMax}`);
+  logger.info(`[${asset.symbol}]   Initial Price: ${initialPrice}`);
   
   const timeframes = {
     '1s': 1, '1m': 60, '5m': 300, '15m': 900, 
@@ -1177,9 +1178,12 @@ async initializeCandlesForAsset(asset, simulator) {
     }
   };
   
+  let finalPrice = initialPrice; // ✅ Track price terakhir (dari 1s)
+  const assetPath = this.firebase.getAssetPath(asset);
+
   for (const [tf, duration] of Object.entries(timeframes)) {
     const candles = {};
-    let price = initialPrice;
+    let price = initialPrice; // Mulai dari initialPrice untuk tiap timeframe agar konsisten
     const volatility = getVolatilityForTimeframe(tf);
     
     for (let i = 239; i >= 0; i--) {
@@ -1192,7 +1196,14 @@ async initializeCandlesForAsset(asset, simulator) {
       const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
       const change = price * volatility * z;
       
-      const close = open + change;
+      let close = open + change;
+      
+      // Enforce min/max price boundaries
+      close = Math.max(
+        asset.simulatorSettings?.minPrice ?? initialPrice * 0.5,
+        Math.min(asset.simulatorSettings?.maxPrice ?? initialPrice * 2.0, close)
+      );
+      
       const high = Math.max(open, close) + Math.abs(change) * Math.random() * 0.5;
       const low = Math.min(open, close) - Math.abs(change) * Math.random() * 0.5;
       
@@ -1212,12 +1223,40 @@ async initializeCandlesForAsset(asset, simulator) {
       price = close;
     }
     
-    const path = `${this.firebase.getAssetPath(asset)}/ohlc_${tf}`;
+    const path = `${assetPath}/ohlc_${tf}`;
     await this.firebase.setRealtimeValue(path, candles);
-    logger.debug(`[${asset.symbol}] Generated ${tf} candles with volatility ${volatility.toFixed(6)}`);
+    
+    // Simpan price terakhir dari timeframe 1s untuk current_price
+    if (tf === '1s') {
+      finalPrice = price;
+    }
+    
+    logger.debug(`[${asset.symbol}] Generated ${tf} candles, final price: ${price.toFixed(6)}`);
   }
   
-  logger.info(`[${asset.symbol}] ✅ 240 candles generated successfully (${VOLATILITY_MULTIPLIER}x volatility mode)`);
+  // ✅ SET CURRENT_PRICE ke finalPrice (price terakhir dari candle 1s), BUKAN initialPrice!
+  const currentPriceData = {
+    price: parseFloat(finalPrice.toFixed(6)),
+    current: parseFloat(finalPrice.toFixed(6)),
+    timestamp: now,
+    datetime: TimezoneUtil.formatDateTime(new Date(now * 1000)),
+    datetime_iso: new Date(now * 1000).toISOString(),
+    timezone: 'Asia/Jakarta',
+    change: 0
+  };
+  
+  await this.firebase.setRealtimeValue(
+    `${assetPath}/current_price`,
+    currentPriceData
+  );
+  
+  // Update simulator current price agar dia melanjutkan dari sini
+  simulator.currentPrice = finalPrice;
+  simulator.isResumed = true;
+  
+  logger.info(`[${asset.symbol}] ✅ 240 candles generated.`);
+  logger.info(`[${asset.symbol}]    Current price set to: ${finalPrice.toFixed(6)} (was ${initialPrice.toFixed(6)})`);
+  logger.info(`[${asset.symbol}]    Simulator will continue from: ${finalPrice.toFixed(6)}`);
 }
 
   async start() {
