@@ -430,6 +430,34 @@ class FirebaseManager {
     }, this.CLEANUP_INTERVAL);
   }
 
+  async listenForNewAssets(onNewAsset) {
+  if (!this.isConnected || !this.db) {
+    logger.warn('Firebase not connected, cannot listen for new assets');
+    return;
+  }
+
+  try {
+    logger.info('Setting up Firestore listener for new assets...');
+    
+    this.db.collection('assets')
+      .where('isActive', '==', true)
+      .where('category', '==', 'normal')
+      .onSnapshot(snapshot => {
+        snapshot.docChanges().forEach(change => {
+          if (change.type === 'added') {
+            const asset = change.doc.data();
+            logger.info(`🔥 Firestore: New asset detected ${asset.symbol}`);
+            onNewAsset({ id: change.doc.id, ...asset });
+          }
+        });
+      });
+      
+    logger.info('Firestore listener active for new assets');
+  } catch (error) {
+    logger.error(`Failed to setup Firestore listener: ${error.message}`);
+  }
+}
+
   async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
@@ -1088,6 +1116,75 @@ class MultiAssetManager {
     }, 120000);
   }
 
+  async setupFirestoreListener() {
+  await this.firebase.listenForNewAssets(async (asset) => {
+    if (this.simulators.has(asset.id)) {
+      return; // Asset sudah ada
+    }
+    
+    logger.info(`🆕 Auto-adding new asset from Firestore: ${asset.symbol}`);
+    
+    try {
+      const simulator = new AssetSimulator(asset, this.firebase);
+      await simulator.loadLastPrice();
+      
+      // 🔥 GENERATE 240 CANDLES untuk asset baru
+      await this.initializeCandlesForAsset(asset, simulator);
+      
+      this.simulators.set(asset.id, simulator);
+      logger.info(`✅ Asset ${asset.symbol} added and initialized with 240 candles`);
+    } catch (error) {
+      logger.error(`Failed to add new asset ${asset.symbol}: ${error.message}`);
+    }
+  });
+}
+
+async initializeCandlesForAsset(asset, simulator) {
+  // Generate 240 candles backward seperti di backend
+  const now = TimezoneUtil.getCurrentTimestamp();
+  const initialPrice = simulator.initialPrice;
+  const volatility = simulator.volatilityMax;
+  
+  const timeframes = {
+    '1s': 1, '1m': 60, '5m': 300, '15m': 900, 
+    '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
+  };
+  
+  for (const [tf, duration] of Object.entries(timeframes)) {
+    const candles = {};
+    let price = initialPrice;
+    
+    for (let i = 239; i >= 0; i--) {
+      const timestamp = now - (i * duration);
+      const open = price;
+      const change = (Math.random() - 0.5) * volatility * price;
+      const close = open + change;
+      const high = Math.max(open, close) * (1 + Math.random() * 0.001);
+      const low = Math.min(open, close) * (1 - Math.random() * 0.001);
+      
+      candles[timestamp] = {
+        timestamp,
+        datetime: TimezoneUtil.formatDateTime(new Date(timestamp * 1000)),
+        datetime_iso: new Date(timestamp * 1000).toISOString(),
+        timezone: 'Asia/Jakarta',
+        open: parseFloat(open.toFixed(6)),
+        high: parseFloat(high.toFixed(6)),
+        low: parseFloat(low.toFixed(6)),
+        close: parseFloat(close.toFixed(6)),
+        volume: Math.floor(1000 + Math.random() * 9000),
+        isCompleted: true
+      };
+      
+      price = close;
+    }
+    
+    const path = `${this.firebase.getAssetPath(asset)}/ohlc_${tf}`;
+    await this.firebase.setRealtimeValue(path, candles);
+  }
+  
+  logger.info(`📊 Generated 240 candles for ${asset.symbol}`);
+}
+
   async start() {
     if (this.isRunning) {
       logger.warn('Manager already running');
@@ -1258,9 +1355,8 @@ async function main() {
     }
   }, 300000);
 
-  try {
-    const initialized = await firebaseManager.initialize();
-    
+try {
+  const initialized = await firebaseManager.initialize();
     if (!initialized) {
       logger.error('Firebase initialization failed');
       process.exit(1);
@@ -1268,9 +1364,11 @@ async function main() {
     
     await manager.start();
     
+    // ✅ TAMBAHKAN INI: Setup listener untuk asset baru
+    await manager.setupFirestoreListener();
+    
   } catch (error) {
     logger.error(`Fatal error: ${error.message}`);
-    logger.error(error.stack);
     process.exit(1);
   }
 }
