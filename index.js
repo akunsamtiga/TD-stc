@@ -80,11 +80,10 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
-    // ✅ FIXED: Retention 1s diperbesar jadi 10 menit (600 detik) agar 240 candles aman
     this.RETENTION_DAYS = {
-      '1s': 0.00694,     // ✅ 10 menit (600 detik) - buffer aman untuk 240 candles
-      '1m': 0.166667,    // 240 candles (4 jam)
-      '5m': 0.833333,    // 240 candles (20 jam)
+      '1s': 0.002778,     // 240 candles (4 menit)
+      '1m': 0.166667,     // 240 candles (4 jam)
+      '5m': 0.833333,     // 240 candles (20 jam)
       '15m': 2.5,        // 240 candles (2.5 hari)
       '30m': 5,          // 240 candles (5 hari)
       '1h': 10,          // 240 candles (10 hari)
