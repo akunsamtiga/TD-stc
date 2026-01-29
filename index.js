@@ -80,11 +80,11 @@ class FirebaseManager {
       lastSuccessTime: Date.now() 
     };
     
-    // ✅ FIXED: Retention sekarang yang menentukan, BUKAN max bars
+    // ✅ FIXED: Retention 1s diperbesar jadi 10 menit (600 detik) agar 240 candles aman
     this.RETENTION_DAYS = {
-      '1s': 0.002778,     // 240 candles (4 menit)
-      '1m': 0.166667,     // 240 candles (4 jam)
-      '5m': 0.833333,     // 240 candles (20 jam)
+      '1s': 0.00694,     // ✅ 10 menit (600 detik) - buffer aman untuk 240 candles
+      '1m': 0.166667,    // 240 candles (4 jam)
+      '5m': 0.833333,    // 240 candles (20 jam)
       '15m': 2.5,        // 240 candles (2.5 hari)
       '30m': 5,          // 240 candles (5 hari)
       '1h': 10,          // 240 candles (10 hari)
@@ -451,7 +451,6 @@ class FirebaseManager {
       const startTime = Date.now();
       const now = TimezoneUtil.getCurrentTimestamp();
       
-      // ✅ FIXED: Convert retention days to seconds
       const retentionSeconds = Math.floor(retention * 86400);
       const cutoffTimestamp = now - retentionSeconds;
       const fullPath = `${path}/ohlc_${tf}`;
@@ -475,12 +474,10 @@ class FirebaseManager {
           const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
           if (allKeys.length === 0) break;
           
-          // ✅ FIXED: HANYA time-based cleanup, TIDAK ADA max bars limit!
           const keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
           
           if (keysToDelete.length === 0) break;
           
-          // ✅ Batch delete with relative paths
           const deletePromises = [];
           for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
             const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
@@ -514,8 +511,7 @@ class FirebaseManager {
         
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         
-        // ✅ Calculate expected bars untuk info
-        const expectedBars = 240;
+        const expectedBars = tf === '1s' ? 600 : 240; // 10 menit untuk 1s
         
         if (totalDeleted > 0) {
           logger.info(
@@ -1110,14 +1106,14 @@ class MultiAssetManager {
     this.isRunning = true;
 
     logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v17.0 - TIME-BASED CLEANUP ONLY');
+    logger.info('MULTI-ASSET SIMULATOR v17.1 - 10MIN RETENTION FIX');
     logger.info('================================================');
     logger.info(`Normal Assets: ${this.simulators.size}`);
     logger.info(`Timezone: Asia/Jakarta (WIB = UTC+7)`);
     logger.info(`Current: ${TimezoneUtil.formatDateTime()}`);
     logger.info(`Update: 1 second`);
     logger.info(`Refresh: 10 minutes`);
-    logger.info(`1s Retention: 4 minutes (240 bars) ✅ NO MAX LIMIT`);
+    logger.info(`1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE`);
     logger.info(`Cleanup: Every 1 minute (time-based only)`);
     logger.info('================================================');
     logger.info('');
@@ -1157,13 +1153,13 @@ class MultiAssetManager {
     }
     
     logger.info('');
-    logger.info(`STATUS REPORT (TIME-BASED CLEANUP - NO MAX BARS LIMIT)`);
+    logger.info(`STATUS REPORT (10-MIN RETENTION - 240 CANDLES SAFE)`);
     logger.info(`================================================`);
     logger.info(`Normal Simulators: ${this.simulators.size}`);
     logger.info(`Status: ${this.isPaused ? 'PAUSED' : 'RUNNING'}`);
     logger.info(`Connection: ${stats.connection.isConnected ? 'OK' : 'DOWN'}`);
     logger.info(`1s Bars Created: ${total1sBars}`);
-    logger.info(`1s Retention: 4 minutes (240 bars) - Time-based only ✅`);
+    logger.info(`1s Retention: 10 minutes (600 detik) ✅`);
     logger.info('');
     
     if (assetInfo.length > 0) {
@@ -1217,11 +1213,11 @@ class MultiAssetManager {
 
 async function main() {
   console.log('');
-  console.log('MULTI-ASSET SIMULATOR v17.0 - TIME-BASED CLEANUP ONLY');
+  console.log('MULTI-ASSET SIMULATOR v17.1 - 10MIN RETENTION FIX');
   console.log(`Process TZ: ${process.env.TZ}`);
   console.log(`Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('1-SECOND TRADING: ENABLED');
-  console.log('1s Retention: 4 minutes (240 bars) ✅ NO MAX LIMIT');
+  console.log('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
   console.log('Cleanup: Time-based ONLY, NO count limit');
   console.log('Crypto: Backend Binance API');
   console.log('Normal: This Simulator');
