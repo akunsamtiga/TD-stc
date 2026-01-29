@@ -1139,17 +1139,16 @@ class MultiAssetManager {
 }
 
 async initializeCandlesForAsset(asset, simulator) {
-  // Generate 240 candles backward seperti di backend
   const now = TimezoneUtil.getCurrentTimestamp();
   const initialPrice = simulator.initialPrice;
   
-  // ✅ ENHANCED: Gunakan volatilitas 50x untuk generating candle历史
-  const VOLATILITY_MULTIPLIER = 50;
+  // ✅ ENHANGED: Gunakan volatilitas 200x untuk generating candle history
+  const VOLATILITY_MULTIPLIER = 200;
   
   const originalVolatilityMax = simulator.volatilityMax;
   const originalVolatilityMin = simulator.volatilityMin;
   
-  // Kalikan dengan 50 untuk initialization (hanya untuk generate candle, bukan untuk simulasi berjalan)
+  // Kalikan dengan 200 untuk initialization
   const volatilityMax = originalVolatilityMax * VOLATILITY_MULTIPLIER;
   const volatilityMin = originalVolatilityMin * VOLATILITY_MULTIPLIER;
   
@@ -1163,42 +1162,36 @@ async initializeCandlesForAsset(asset, simulator) {
     '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
   };
   
-  // Fungsi untuk mendapatkan volatility berdasarkan timeframe (sama seperti backend)
   const getVolatilityForTimeframe = (tf) => {
     if (tf === '1s' || tf === '1m') {
       return volatilityMin + Math.random() * (volatilityMax - volatilityMin);
     } else if (tf === '5m' || tf === '15m' || tf === '30m') {
-      // Blend antara second dan daily (asumsi daily 10x lebih besar)
       const dailyMin = volatilityMin * 10;
       const dailyMax = volatilityMax * 10;
       return ((volatilityMin + dailyMin) / 2) + Math.random() * ((volatilityMax + dailyMax) / 2 - (volatilityMin + dailyMin) / 2);
     } else {
-      // Daily volatility (10x dari second)
       return (volatilityMin * 10) + Math.random() * (volatilityMax * 10 - volatilityMin * 10);
     }
   };
   
-  let finalPrice = initialPrice; // ✅ Track price terakhir (dari 1s)
+  let finalPrice = initialPrice;
   const assetPath = this.firebase.getAssetPath(asset);
 
   for (const [tf, duration] of Object.entries(timeframes)) {
     const candles = {};
-    let price = initialPrice; // Mulai dari initialPrice untuk tiap timeframe agar konsisten
+    let price = initialPrice;
     const volatility = getVolatilityForTimeframe(tf);
     
     for (let i = 239; i >= 0; i--) {
       const timestamp = now - (i * duration);
       const open = price;
       
-      // Gunakan Box-Muller transform untuk distribusi normal (sama seperti backend)
       const u1 = Math.random();
       const u2 = Math.random();
       const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
       const change = price * volatility * z;
       
       let close = open + change;
-      
-      // Enforce min/max price boundaries
       close = Math.max(
         asset.simulatorSettings?.minPrice ?? initialPrice * 0.5,
         Math.min(asset.simulatorSettings?.maxPrice ?? initialPrice * 2.0, close)
@@ -1226,7 +1219,6 @@ async initializeCandlesForAsset(asset, simulator) {
     const path = `${assetPath}/ohlc_${tf}`;
     await this.firebase.setRealtimeValue(path, candles);
     
-    // Simpan price terakhir dari timeframe 1s untuk current_price
     if (tf === '1s') {
       finalPrice = price;
     }
@@ -1234,7 +1226,7 @@ async initializeCandlesForAsset(asset, simulator) {
     logger.debug(`[${asset.symbol}] Generated ${tf} candles, final price: ${price.toFixed(6)}`);
   }
   
-  // ✅ SET CURRENT_PRICE ke finalPrice (price terakhir dari candle 1s), BUKAN initialPrice!
+  // Set current_price ke finalPrice
   const currentPriceData = {
     price: parseFloat(finalPrice.toFixed(6)),
     current: parseFloat(finalPrice.toFixed(6)),
@@ -1250,13 +1242,12 @@ async initializeCandlesForAsset(asset, simulator) {
     currentPriceData
   );
   
-  // Update simulator current price agar dia melanjutkan dari sini
+  // Update simulator agar melanjutkan dari price terakhir
   simulator.currentPrice = finalPrice;
   simulator.isResumed = true;
   
-  logger.info(`[${asset.symbol}] ✅ 240 candles generated.`);
+  logger.info(`[${asset.symbol}] ✅ 240 candles generated (${VOLATILITY_MULTIPLIER}x volatility).`);
   logger.info(`[${asset.symbol}]    Current price set to: ${finalPrice.toFixed(6)} (was ${initialPrice.toFixed(6)})`);
-  logger.info(`[${asset.symbol}]    Simulator will continue from: ${finalPrice.toFixed(6)}`);
 }
 
   async start() {
