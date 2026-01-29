@@ -1142,24 +1142,58 @@ async initializeCandlesForAsset(asset, simulator) {
   // Generate 240 candles backward seperti di backend
   const now = TimezoneUtil.getCurrentTimestamp();
   const initialPrice = simulator.initialPrice;
-  const volatility = simulator.volatilityMax;
+  
+  // ✅ ENHANCED: Gunakan volatilitas 100x untuk generating candle历史
+  // Ini membuat candle history terlihat lebih "hidup"
+  const originalVolatilityMax = simulator.volatilityMax;
+  const originalVolatilityMin = simulator.volatilityMin;
+  
+  // Kalikan dengan 100 untuk initialization
+  const volatilityMax = originalVolatilityMax * 100;
+  const volatilityMin = originalVolatilityMin * 100;
+  
+  logger.info(`[${asset.symbol}] Initializing 240 candles with 100x volatility:`);
+  logger.info(`[${asset.symbol}]   Original: ${originalVolatilityMin} - ${originalVolatilityMax}`);
+  logger.info(`[${asset.symbol}]   Used: ${volatilityMin} - ${volatilityMax}`);
   
   const timeframes = {
     '1s': 1, '1m': 60, '5m': 300, '15m': 900, 
     '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
   };
   
+  // Fungsi untuk mendapatkan volatility berdasarkan timeframe (sama seperti backend)
+  const getVolatilityForTimeframe = (tf) => {
+    if (tf === '1s' || tf === '1m') {
+      return volatilityMin + Math.random() * (volatilityMax - volatilityMin);
+    } else if (tf === '5m' || tf === '15m' || tf === '30m') {
+      // Blend antara second dan daily (asumsi daily 10x lebih besar)
+      const dailyMin = volatilityMin * 10;
+      const dailyMax = volatilityMax * 10;
+      return ((volatilityMin + dailyMin) / 2) + Math.random() * ((volatilityMax + dailyMax) / 2 - (volatilityMin + dailyMin) / 2);
+    } else {
+      // Daily volatility (10x dari second)
+      return (volatilityMin * 10) + Math.random() * (volatilityMax * 10 - volatilityMin * 10);
+    }
+  };
+  
   for (const [tf, duration] of Object.entries(timeframes)) {
     const candles = {};
     let price = initialPrice;
+    const volatility = getVolatilityForTimeframe(tf);
     
     for (let i = 239; i >= 0; i--) {
       const timestamp = now - (i * duration);
       const open = price;
-      const change = (Math.random() - 0.5) * volatility * price;
+      
+      // Gunakan Box-Muller transform untuk distribusi normal (sama seperti backend)
+      const u1 = Math.random();
+      const u2 = Math.random();
+      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      const change = price * volatility * z;
+      
       const close = open + change;
-      const high = Math.max(open, close) * (1 + Math.random() * 0.001);
-      const low = Math.min(open, close) * (1 - Math.random() * 0.001);
+      const high = Math.max(open, close) + Math.abs(change) * Math.random() * 0.5;
+      const low = Math.min(open, close) - Math.abs(change) * Math.random() * 0.5;
       
       candles[timestamp] = {
         timestamp,
@@ -1179,9 +1213,10 @@ async initializeCandlesForAsset(asset, simulator) {
     
     const path = `${this.firebase.getAssetPath(asset)}/ohlc_${tf}`;
     await this.firebase.setRealtimeValue(path, candles);
+    logger.info(`[${asset.symbol}] Generated ${tf} candles with volatility ${volatility.toFixed(6)}`);
   }
   
-  logger.info(`📊 Generated 240 candles for ${asset.symbol}`);
+  logger.info(`[${asset.symbol}] ✅ 240 candles generated successfully (100x volatility mode)`);
 }
 
   async start() {
