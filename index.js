@@ -1143,16 +1143,17 @@ async initializeCandlesForAsset(asset, simulator) {
   const now = TimezoneUtil.getCurrentTimestamp();
   const initialPrice = simulator.initialPrice;
   
-  // ✅ ENHANCED: Gunakan volatilitas 100x untuk generating candle历史
-  // Ini membuat candle history terlihat lebih "hidup"
+  // ✅ ENHANCED: Gunakan volatilitas 50x untuk generating candle历史
+  const VOLATILITY_MULTIPLIER = 50; // Ubah dari 100 menjadi 50
+  
   const originalVolatilityMax = simulator.volatilityMax;
   const originalVolatilityMin = simulator.volatilityMin;
   
-  // Kalikan dengan 100 untuk initialization
-  const volatilityMax = originalVolatilityMax * 100;
-  const volatilityMin = originalVolatilityMin * 100;
+  // Kalikan dengan 50 untuk initialization
+  const volatilityMax = originalVolatilityMax * VOLATILITY_MULTIPLIER;
+  const volatilityMin = originalVolatilityMin * VOLATILITY_MULTIPLIER;
   
-  logger.info(`[${asset.symbol}] Initializing 240 candles with 100x volatility:`);
+  logger.info(`[${asset.symbol}] Initializing 240 candles with ${VOLATILITY_MULTIPLIER}x volatility:`);
   logger.info(`[${asset.symbol}]   Original: ${originalVolatilityMin} - ${originalVolatilityMax}`);
   logger.info(`[${asset.symbol}]   Used: ${volatilityMin} - ${volatilityMax}`);
   
@@ -1213,10 +1214,10 @@ async initializeCandlesForAsset(asset, simulator) {
     
     const path = `${this.firebase.getAssetPath(asset)}/ohlc_${tf}`;
     await this.firebase.setRealtimeValue(path, candles);
-    logger.info(`[${asset.symbol}] Generated ${tf} candles with volatility ${volatility.toFixed(6)}`);
+    logger.debug(`[${asset.symbol}] Generated ${tf} candles with volatility ${volatility.toFixed(6)}`);
   }
   
-  logger.info(`[${asset.symbol}] ✅ 240 candles generated successfully (100x volatility mode)`);
+  logger.info(`[${asset.symbol}] ✅ 240 candles generated successfully (${VOLATILITY_MULTIPLIER}x volatility mode)`);
 }
 
   async start() {
