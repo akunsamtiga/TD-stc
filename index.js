@@ -1142,13 +1142,13 @@ async initializeCandlesForAsset(asset, simulator) {
   const now = TimezoneUtil.getCurrentTimestamp();
   const initialPrice = simulator.initialPrice;
   
-  // ✅ ENHANGED: Gunakan volatilitas 200x untuk generating candle history
-  const VOLATILITY_MULTIPLIER = 200;
+  // ✅ ENHANCED: Gunakan volatilitas 10x untuk generating candle history (natural)
+  const VOLATILITY_MULTIPLIER = 10;
   
   const originalVolatilityMax = simulator.volatilityMax;
   const originalVolatilityMin = simulator.volatilityMin;
   
-  // Kalikan dengan 200 untuk initialization
+  // Kalikan dengan 10 untuk initialization
   const volatilityMax = originalVolatilityMax * VOLATILITY_MULTIPLIER;
   const volatilityMin = originalVolatilityMin * VOLATILITY_MULTIPLIER;
   
