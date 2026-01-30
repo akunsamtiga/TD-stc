@@ -460,44 +460,47 @@ class FirebaseManager {
   /**
    * ✅ NEW: Listen for scheduled trends from Realtime Database
    */
-  async listenForScheduledTrends(onTrendReceived) {
-    if (!this.isConnected || !this.realtimeDbAdmin) {
-      logger.warn('Firebase not connected, cannot listen for scheduled trends');
-      return;
-    }
-
-    try {
-      logger.info('Setting up RTDB listener for scheduled trends...');
-      
-      const trendsRef = this.realtimeDbAdmin.ref('_scheduled_trends');
-      
-      trendsRef.on('child_added', (snapshot) => {
-        const assetSymbol = snapshot.key;
-        const trendData = snapshot.val();
-        
-        if (trendData && trendData.isActive) {
-          logger.info(`🔥 RTDB: Scheduled trend received for ${assetSymbol}: ${trendData.trend} (${trendData.timeframe})`);
-          onTrendReceived(assetSymbol, trendData);
-        }
-      });
-      
-      trendsRef.on('child_changed', (snapshot) => {
-        const assetSymbol = snapshot.key;
-        const trendData = snapshot.val();
-        
-        if (trendData && trendData.isActive) {
-          logger.info(`🔥 RTDB: Scheduled trend updated for ${assetSymbol}: ${trendData.trend} (${trendData.timeframe})`);
-          onTrendReceived(assetSymbol, trendData);
-        }
-      });
-      
-      logger.info('✅ RTDB listener active for scheduled trends');
-    } catch (error) {
-      logger.error(`Failed to setup RTDB scheduled trends listener: ${error.message}`);
-    }
+  // Di index.js simulator, dalam method listenForScheduledTrends
+async listenForScheduledTrends(onTrendReceived) {
+  if (!this.isConnected || !this.realtimeDbAdmin) {
+    this.logger.warn('⚠️ Admin SDK not available, scheduled trends will not work in REST mode');
+    return;
   }
 
-  async cleanupAsset(asset) {
+  try {
+    this.logger.info('Setting up RTDB listener for scheduled trends...');
+    
+    const trendsRef = this.realtimeDbAdmin.ref('_scheduled_trends');
+    
+    trendsRef.on('child_added', (snapshot) => {
+      const normalizedSymbol = snapshot.key; // e.g., "tes"
+      const trendData = snapshot.val();
+      
+      // Cari asset berdasarkan lowercase symbol
+      let targetSimulator = null;
+      for (const [id, simulator] of this.simulators.entries()) {
+        const simSymbol = simulator.asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_');
+        if (simSymbol === normalizedSymbol) {
+          targetSimulator = simulator;
+          break;
+        }
+      }
+      
+      if (targetSimulator && trendData?.isActive) {
+        this.logger.info(`🔥 Scheduled trend received for ${targetSimulator.asset.symbol}: ${trendData.trend}`);
+        targetSimulator.applyScheduledTrend(trendData);
+      } else {
+        this.logger.debug(`Trend received for ${normalizedSymbol} but no simulator found (symbol mismatch)`);
+      }
+    });
+    
+    this.logger.info('✅ Scheduled trends listener active');
+  } catch (error) {
+    this.logger.error(`Failed to setup listener: ${error.message}`);
+  }
+}
+
+async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
@@ -1264,25 +1267,37 @@ class MultiAssetManager {
  * ✅ NEW: Setup listener for scheduled trends from RTDB
  */
 async setupScheduledTrendListener() {
-  await this.firebase.listenForScheduledTrends((assetSymbol, trendData) => {
-    // Find simulator for this asset
-    let targetSimulator = null;
-    
-    for (const [id, simulator] of this.simulators.entries()) {
-      if (simulator.asset.symbol === assetSymbol) {
-        targetSimulator = simulator;
-        break;
-      }
+  const checkTrends = async () => {
+    try {
+      if (!this.firebase.isConnected) return;
+      
+      // Method untuk fetch data (works untuk REST dan Admin)
+      const trendsData = await this.firebase.getRealtimeDbValue('_scheduled_trends');
+      
+      if (!trendsData) return;
+      
+      Object.entries(trendsData).forEach(([assetSymbol, trendData]) => {
+        // Cari simulator dengan symbol yang match
+        for (const [id, simulator] of this.simulators.entries()) {
+          if (simulator.asset.symbol === assetSymbol && trendData.isActive) {
+            const now = Date.now();
+            if (now >= trendData.startTime && now <= trendData.endTime) {
+              this.logger.info(`📊 Applying trend to ${assetSymbol}`);
+              simulator.applyScheduledTrend(trendData);
+            }
+          }
+        }
+      });
+    } catch (error) {
+      this.logger.debug(`Trend poll error: ${error.message}`);
     }
-    
-    if (targetSimulator) {
-      logger.info(`📊 Applying scheduled trend to ${assetSymbol}`);
-      targetSimulator.applyScheduledTrend(trendData);
-    } else {
-      logger.warn(`⚠️  Scheduled trend received for ${assetSymbol} but asset not found in simulators`);
-    }
-  });
+  };
+  
+  // Polling setiap 1 detik (untuk REST mode)
+  setInterval(checkTrends, 1000);
+  this.logger.info('Scheduled trends polling started (1s interval)');
 }
+
 
 async initializeCandlesForAsset(asset, simulator) {
   const now = TimezoneUtil.getCurrentTimestamp();
