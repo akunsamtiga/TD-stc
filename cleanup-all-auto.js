@@ -2,8 +2,7 @@
 
 /**
  * =======================================================
- * REALTIME DATABASE CLEANUP - DELETE ALL ASSETS
- * SIMPLIFIED: No classification, delete everything
+ * REALTIME DATABASE CLEANUP - PM2 BACKGROUND MODE
  * =======================================================
  */
 
@@ -18,7 +17,8 @@ const colors = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
-  cyan: '\x1b[36m'
+  cyan: '\x1b[36m',
+  bold: '\x1b[1m'
 };
 
 function log(message, color = 'reset') {
@@ -36,6 +36,7 @@ const ASSETS = [
 let totalDeleted = 0;
 let totalFailed = 0;
 let startTime = Date.now();
+let isShuttingDown = false;
 
 async function initFirebase() {
   const serviceAccount = {
@@ -58,17 +59,14 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Fungsi recursive delete - sederhana, tidak ada klasifikasi
 async function deleteRecursive(db, path, depth = 0) {
-  const indent = '  '.repeat(depth);
+  if (isShuttingDown) return { success: false, count: 0 };
   
   try {
-    // Coba hapus langsung dulu
     await db.ref(path).remove();
     totalDeleted++;
     return { success: true, count: 1 };
   } catch (error) {
-    // Kalau terlalu besar, hapus children dulu
     if (!error.message.includes('TOO_BIG') && !error.message.includes('large')) {
       totalFailed++;
       return { success: false, error: error.message };
@@ -76,7 +74,6 @@ async function deleteRecursive(db, path, depth = 0) {
   }
 
   try {
-    // Ambil keys saja (tidak load values)
     const snapshot = await db.ref(path).once('value');
     if (!snapshot.exists()) return { success: true, count: 0 };
     
@@ -90,16 +87,16 @@ async function deleteRecursive(db, path, depth = 0) {
       return { success: true, count: 1 };
     }
 
-    // Log untuk level 0 dan 1 saja
     if (depth <= 1) {
-      log(`${indent}📁 ${path}: ${keys.length} items`, 'cyan');
+      log(`${'  '.repeat(depth)}📁 ${path}: ${keys.length} items`, 'cyan');
     }
 
     let count = 0;
-    const batchSize = 20; // Consistent batch size untuk semua
+    const batchSize = 20;
     
-    // Hapus dalam batch
     for (let i = 0; i < keys.length; i += batchSize) {
+      if (isShuttingDown) break;
+      
       const batch = keys.slice(i, i + batchSize);
       
       await Promise.all(batch.map(key => 
@@ -108,25 +105,23 @@ async function deleteRecursive(db, path, depth = 0) {
           .catch(() => totalFailed++)
       ));
       
-      // Progress report untuk level 1
       if (depth === 1 && keys.length > 100) {
         const progress = Math.min(i + batchSize, keys.length);
         if (i % (batchSize * 5) === 0 || progress === keys.length) {
           const percent = Math.round((progress / keys.length) * 100);
-          log(`${indent}   ${percent}% (${progress}/${keys.length})`, 'blue');
+          log(`   ${percent}% (${progress}/${keys.length})`, 'blue');
         }
       }
       
-      await sleep(100); // Consistent delay
+      await sleep(100);
     }
     
-    // Hapus parent setelah children habis
-    try {
-      await db.ref(path).remove();
-      count++;
-      totalDeleted++;
-    } catch (e) {
-      // Sudah terhapus atau tidak bisa dihapus
+    if (!isShuttingDown) {
+      try {
+        await db.ref(path).remove();
+        count++;
+        totalDeleted++;
+      } catch (e) {}
     }
     
     return { success: true, count };
@@ -140,9 +135,15 @@ async function deleteAllData(db) {
   log('\n========================================', 'cyan');
   log('🚀 STARTING DATABASE CLEANUP', 'bold');
   log(`📊 Total assets: ${ASSETS.length}`, 'blue');
+  log(`🆔 Process ID: ${process.pid}`, 'blue');
   log('========================================\n', 'cyan');
   
   for (let i = 0; i < ASSETS.length; i++) {
+    if (isShuttingDown) {
+      log('⚠️  Shutdown requested, stopping...', 'yellow');
+      break;
+    }
+    
     const asset = ASSETS[i];
     log(`[${i + 1}/${ASSETS.length}] 🗑️  Deleting /${asset}...`, 'cyan');
     
@@ -156,11 +157,9 @@ async function deleteAllData(db) {
     
     totalDeleted += result.count || 0;
     
-    // Progress overall
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
     log(`   📊 Total: ${totalDeleted} deleted | ${elapsed}s elapsed\n`, 'blue');
     
-    // Jeda antar asset
     if (i < ASSETS.length - 1) await sleep(1000);
   }
   
@@ -171,27 +170,46 @@ async function deleteAllData(db) {
   log(`⏱️  Time: ${totalTime}s`, 'blue');
   if (totalFailed > 0) log(`⚠️  Failed: ${totalFailed}`, 'red');
   log('========================================', 'cyan');
+  
+  // Exit untuk PM2 (auto-exit setelah selesai)
+  setTimeout(() => {
+    process.exit(totalFailed > 0 ? 1 : 0);
+  }, 2000);
 }
 
 async function main() {
   try {
-    log('\n🗑️  FIREBASE DATABASE CLEANUP\n', 'cyan');
+    log('\n🗑️  FIREBASE DATABASE CLEANUP - PM2 MODE\n', 'cyan');
     
     const db = await initFirebase();
     log('✅ Firebase connected\n', 'green');
     
     await deleteAllData(db);
     
-    process.exit(0);
   } catch (error) {
-    log(`\n❌ Error: ${error.message}`, 'red');
+    log(`\n❌ Fatal error: ${error.message}`, 'red');
     process.exit(1);
   }
 }
 
+// PM2 Signal Handling
+process.on('SIGTERM', () => {
+  log('\n⚠️  SIGTERM received - stopping gracefully...', 'yellow');
+  log(`Progress: ${totalDeleted} deleted so far`, 'blue');
+  isShuttingDown = true;
+  setTimeout(() => process.exit(0), 5000);
+});
+
 process.on('SIGINT', () => {
-  log('\n⚠️  Stopped by user', 'yellow');
-  process.exit(0);
+  log('\n⚠️  SIGINT received - stopping...', 'yellow');
+  isShuttingDown = true;
+  setTimeout(() => process.exit(0), 2000);
+});
+
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+  log(`\n❌ Uncaught Exception: ${err.message}`, 'red');
+  process.exit(1);
 });
 
 main();
