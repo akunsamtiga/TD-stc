@@ -457,6 +457,46 @@ class FirebaseManager {
   }
 }
 
+  /**
+   * ✅ NEW: Listen for scheduled trends from Realtime Database
+   */
+  async listenForScheduledTrends(onTrendReceived) {
+    if (!this.isConnected || !this.realtimeDbAdmin) {
+      logger.warn('Firebase not connected, cannot listen for scheduled trends');
+      return;
+    }
+
+    try {
+      logger.info('Setting up RTDB listener for scheduled trends...');
+      
+      const trendsRef = this.realtimeDbAdmin.ref('_scheduled_trends');
+      
+      trendsRef.on('child_added', (snapshot) => {
+        const assetSymbol = snapshot.key;
+        const trendData = snapshot.val();
+        
+        if (trendData && trendData.isActive) {
+          logger.info(`🔥 RTDB: Scheduled trend received for ${assetSymbol}: ${trendData.trend} (${trendData.timeframe})`);
+          onTrendReceived(assetSymbol, trendData);
+        }
+      });
+      
+      trendsRef.on('child_changed', (snapshot) => {
+        const assetSymbol = snapshot.key;
+        const trendData = snapshot.val();
+        
+        if (trendData && trendData.isActive) {
+          logger.info(`🔥 RTDB: Scheduled trend updated for ${assetSymbol}: ${trendData.trend} (${trendData.timeframe})`);
+          onTrendReceived(assetSymbol, trendData);
+        }
+      });
+      
+      logger.info('✅ RTDB listener active for scheduled trends');
+    } catch (error) {
+      logger.error(`Failed to setup RTDB scheduled trends listener: ${error.message}`);
+    }
+  }
+
   async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
@@ -780,6 +820,9 @@ class AssetSimulator {
     this.PRICE_UPDATE_INTERVAL = 1000;
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
 
+    // ✅ NEW: Scheduled trend support
+    this.scheduledTrend = null;
+
     logger.info('');
     logger.info(`Simulator initialized: ${asset.symbol}`);
     logger.info(`Name: ${asset.name}`);
@@ -824,6 +867,48 @@ class AssetSimulator {
   }
 
   generatePriceMovement() {
+    // ✅ NEW: Check if there's an active scheduled trend
+    if (this.scheduledTrend) {
+      const now = Date.now();
+      
+      // Check if trend is still active
+      if (now >= this.scheduledTrend.startTime && now <= this.scheduledTrend.endTime) {
+        // Apply scheduled trend
+        const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
+        
+        // Force direction based on trend
+        let direction;
+        if (this.scheduledTrend.trend === 'buy') {
+          direction = 1;  // Force upward movement
+        } else if (this.scheduledTrend.trend === 'sell') {
+          direction = -1; // Force downward movement
+        }
+        
+        // Increase volatility for more noticeable trend
+        const trendVolatilityMultiplier = 2.0;
+        const priceChange = this.currentPrice * volatility * direction * trendVolatilityMultiplier;
+        let newPrice = this.currentPrice + priceChange;
+        
+        // Still respect min/max boundaries
+        if (newPrice < this.minPrice) {
+          newPrice = this.minPrice;
+          logger.debug(`[${this.asset.symbol}] Scheduled trend hit min price ${this.minPrice}`);
+        }
+        if (newPrice > this.maxPrice) {
+          newPrice = this.maxPrice;
+          logger.debug(`[${this.asset.symbol}] Scheduled trend hit max price ${this.maxPrice}`);
+        }
+        
+        this.lastDirection = direction;
+        return newPrice;
+      } else {
+        // Trend expired, clear it
+        logger.info(`[${this.asset.symbol}] Scheduled trend expired, reverting to normal`);
+        this.scheduledTrend = null;
+      }
+    }
+    
+    // Normal price generation (no scheduled trend)
     const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
     
     let direction = Math.random() < 0.5 ? -1 : 1;
@@ -982,6 +1067,43 @@ class AssetSimulator {
     logger.info(`[${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice}`);
   }
 
+  /**
+   * ✅ NEW: Apply scheduled trend from backend
+   */
+  applyScheduledTrend(trendData) {
+    const now = Date.now();
+    
+    // Check if trend is still active
+    if (now < trendData.startTime || now > trendData.endTime) {
+      logger.info(`[${this.asset.symbol}] Scheduled trend expired or not yet active`);
+      this.scheduledTrend = null;
+      return;
+    }
+    
+    this.scheduledTrend = {
+      trend: trendData.trend,
+      timeframe: trendData.timeframe,
+      startTime: trendData.startTime,
+      endTime: trendData.endTime,
+      scheduleId: trendData.scheduleId,
+      startPrice: trendData.startPrice,
+    };
+    
+    const remainingMs = trendData.endTime - now;
+    const remainingSeconds = Math.floor(remainingMs / 1000);
+    
+    logger.info(`[${this.asset.symbol}] ✅ Scheduled trend applied: ${trendData.trend} (${trendData.timeframe})`);
+    logger.info(`[${this.asset.symbol}] 📅 Active for ${remainingSeconds}s (until ${new Date(trendData.endTime).toLocaleTimeString()})`);
+    
+    // Set timeout to clear trend when it expires
+    setTimeout(() => {
+      if (this.scheduledTrend && this.scheduledTrend.scheduleId === trendData.scheduleId) {
+        logger.info(`[${this.asset.symbol}] 🏁 Scheduled trend ${trendData.trend} completed`);
+        this.scheduledTrend = null;
+      }
+    }, remainingMs);
+  }
+
   getInfo() {
     return {
       symbol: this.asset.symbol,
@@ -1134,6 +1256,30 @@ class MultiAssetManager {
       logger.info(`✅ Asset ${asset.symbol} added and initialized with 240 candles`);
     } catch (error) {
       logger.error(`Failed to add new asset ${asset.symbol}: ${error.message}`);
+    }
+  });
+}
+
+/**
+ * ✅ NEW: Setup listener for scheduled trends from RTDB
+ */
+async setupScheduledTrendListener() {
+  await this.firebase.listenForScheduledTrends((assetSymbol, trendData) => {
+    // Find simulator for this asset
+    let targetSimulator = null;
+    
+    for (const [id, simulator] of this.simulators.entries()) {
+      if (simulator.asset.symbol === assetSymbol) {
+        targetSimulator = simulator;
+        break;
+      }
+    }
+    
+    if (targetSimulator) {
+      logger.info(`📊 Applying scheduled trend to ${assetSymbol}`);
+      targetSimulator.applyScheduledTrend(trendData);
+    } else {
+      logger.warn(`⚠️  Scheduled trend received for ${assetSymbol} but asset not found in simulators`);
     }
   });
 }
@@ -1431,6 +1577,9 @@ try {
     
     // ✅ TAMBAHKAN INI: Setup listener untuk asset baru
     await manager.setupFirestoreListener();
+    
+    // ✅ NEW: Setup listener untuk scheduled trends
+    await manager.setupScheduledTrendListener();
     
   } catch (error) {
     logger.error(`Fatal error: ${error.message}`);
