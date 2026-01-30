@@ -3,24 +3,18 @@
 /**
  * =======================================================
  * REALTIME DATABASE AUTO CLEANUP - DELETE ALL DATA
- * FIXED: Stuck on large root scan, now using targeted paths
+ * FIXED: Dynamic scanning with shallow query + pagination
  * =======================================================
  * 
+ * Script ini akan:
+ * 1. Scan otomatis semua top-level paths (tidak hardcode)
+ * 2. Gunakan REST API shallow query (tidak hang di database besar)
+ * 3. Fallback ke paginated Admin SDK kalau REST gagal
+ * 4. Handle paths besar (OHLC) dengan chunk size dinamis
+ * 
  * CARA PAKAI:
- * 1. Jalankan dengan PM2:
- *    pm2 start cleanup-all-auto.js --name "db-cleanup" --node-args="--max-old-space-size=4096"
- * 
- * 2. Monitor progress:
- *    pm2 logs db-cleanup
- * 
- * 3. Stop jika perlu:
- *    pm2 stop db-cleanup
- * 
- * FIXES:
- * - Tidak lagi scan root (/) yang bikin hang pada DB besar
- * - Menggunakan Firebase REST API shallow query untuk check paths
- * - Chunk size dinamis: kecil untuk OHLC 1s/1m, besar untuk lainnya
- * - Progress tracking real-time dengan ETA
+ * pm2 start cleanup-all-auto.js --name "db-cleanup" --node-args="--max-old-space-size=8192"
+ * pm2 logs db-cleanup
  * 
  * =======================================================
  */
@@ -28,6 +22,7 @@
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import https from 'https';
+import url from 'url';
 
 dotenv.config();
 
@@ -47,29 +42,9 @@ function log(message, color = 'reset') {
   console.log(`[${timestamp}] ${colors[color]}${message}${colors.reset}`);
 }
 
-// Predefined paths berdasarkan struktur database kamu
-const PREDEFINED_PATHS = [
-  'btcusd',
-  'current_price',
-  'change',
-  'datetime',
-  'datetime_iso',
-  'price',
-  'timestamp',
-  'timezone',
-  'ohlc_15m',
-  'ohlc_1d',
-  'ohlc_1h',
-  'ohlc_1m',
-  'ohlc_1s',    // Hati-hati: sangat besar!
-  'ohlc_30m',
-  'ohlc_4h',
-  'ohlc_5m'
-];
-
-// Paths yang dikenal besar (perlu treatment khusus)
-const LARGE_PATHS = ['ohlc_1s', 'ohlc_1m', 'ohlc_5m'];
-const MEDIUM_PATHS = ['ohlc_15m', 'ohlc_30m', 'ohlc_1h', 'ohlc_4h', 'ohlc_1d', 'btcusd'];
+// Paths yang dikenal berpotensi besar (untuk treatment khusus)
+const LARGE_PATHS = ['ohlc_1s', 'ohlc_1m', 'ohlc_5m', 'ticks', 'trades'];
+const MEDIUM_PATHS = ['ohlc_15m', 'ohlc_30m', 'ohlc_1h', 'ohlc_4h', 'ohlc_1d'];
 
 let totalDeleted = 0;
 let totalFailed = 0;
@@ -91,8 +66,6 @@ async function initFirebase() {
     }
 
     const db = admin.database();
-    
-    // Get access token untuk REST API calls
     const accessToken = await admin.app().options.credential.getAccessToken();
     
     log('✅ Firebase initialized successfully', 'green');
@@ -113,36 +86,36 @@ async function sleep(ms) {
 }
 
 /**
- * Menggunakan Firebase REST API dengan shallow=true
- * Hanya mengambil keys, tidak fetch values (jauh lebih cepat & ringan)
+ * REST API call dengan timeout dan error handling
  */
-async function getKeysShallow(dbUrl, path, authToken, timeoutMs = 30000) {
+function restApiRequest(dbUrl, path, authToken, params = {}, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
-    const encodedPath = path === '/' ? '' : encodeURIComponent(path).replace(/%2F/g, '/');
-    const url = `${dbUrl.replace(/\/$/, '')}/${encodedPath}.json?shallow=true&auth=${authToken}`;
+    const queryParams = new URLSearchParams({ ...params, auth: authToken });
+    const pathEncoded = path === '/' ? '' : path; // root path handling
+    const fullUrl = `${dbUrl.replace(/\/$/, '')}/${pathEncoded}.json?${queryParams.toString()}`;
     
-    const req = https.get(url, (res) => {
+    const req = https.get(fullUrl, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
           if (res.statusCode === 404) {
-            resolve([]); // Path tidak exists
+            resolve(null);
             return;
           }
           if (res.statusCode !== 200) {
-            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+            reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
             return;
           }
           const json = JSON.parse(data);
-          resolve(Object.keys(json || {}));
+          resolve(json);
         } catch (e) {
           reject(e);
         }
       });
     });
     
-    req.on('error', reject);
+    req.on('error', (err) => reject(new Error(`Request failed: ${err.message}`)));
     req.setTimeout(timeoutMs, () => {
       req.destroy();
       reject(new Error(`Timeout after ${timeoutMs}ms`));
@@ -150,29 +123,117 @@ async function getKeysShallow(dbUrl, path, authToken, timeoutMs = 30000) {
   });
 }
 
-async function checkPathExists(dbUrl, path, authToken) {
+/**
+ * METHOD 1: Shallow query untuk scan keys (paling cepat untuk root)
+ * Hanya ambil keys, tidak values
+ */
+async function scanRootShallow(dbUrl, token) {
   try {
-    const keys = await getKeysShallow(dbUrl, path, authToken, 10000); // 10s timeout untuk check
-    return keys.length > 0;
+    log('🔍 Scanning root with shallow query...', 'cyan');
+    const result = await restApiRequest(dbUrl, '/', token, { shallow: 'true' }, 30000);
+    
+    if (!result || typeof result !== 'object') {
+      return [];
+    }
+    
+    const keys = Object.keys(result);
+    log(`✅ Found ${keys.length} top-level paths via shallow scan`, 'green');
+    return keys;
   } catch (error) {
-    return false;
+    log(`⚠️  Shallow scan failed: ${error.message}`, 'yellow');
+    return null; // Return null untuk trigger fallback
   }
 }
 
-// FIXED: Get keys dengan fallback ke REST API shallow query
-async function getKeysOnly(db, dbUrl, token, path) {
+/**
+ * METHOD 2: Paginated scan menggunakan Admin SDK (fallback)
+ * Gunakan limitToFirst untuk scan bertahap tanpa load semua data
+ */
+async function scanRootPaginated(db, batchSize = 100) {
   try {
-    // Coba pakai REST API dulu (lebih cepat untuk paths besar)
-    const keys = await getKeysShallow(dbUrl, path, token);
-    return keys;
-  } catch (error) {
-    // Fallback ke Admin SDK kalau REST gagal
-    log(`   ⚠️  REST API failed for ${path}, falling back to Admin SDK...`, 'yellow');
-    try {
-      const snapshot = await db.ref(path).once('value');
-      if (!snapshot.exists()) return [];
+    log('🔍 Scanning root with pagination (fallback)...', 'cyan');
+    const allKeys = new Set();
+    let lastKey = null;
+    let iteration = 0;
+    const maxIterations = 1000; // Safety limit
+    
+    while (iteration < maxIterations) {
+      iteration++;
+      let query = db.ref('/').orderByKey();
       
-      const keys = [];
+      if (lastKey) {
+        query = query.startAfter(lastKey);
+      }
+      
+      query = query.limitToFirst(batchSize);
+      
+      const snapshot = await query.once('value');
+      
+      if (!snapshot.exists()) break;
+      
+      let foundInBatch = 0;
+      snapshot.forEach((child) => {
+        allKeys.add(child.key);
+        lastKey = child.key;
+        foundInBatch++;
+      });
+      
+      if (foundInBatch === 0) break;
+      
+      if (iteration % 10 === 0) {
+        process.stdout.write(`\r   Scanned ${allKeys.size} keys so far...`);
+      }
+      
+      // Delay kecil untuk tidak overwhelm database
+      if (foundInBatch === batchSize) {
+        await sleep(100);
+      } else {
+        break; // Last batch
+      }
+    }
+    
+    console.log(); // New line after progress
+    log(`✅ Found ${allKeys.size} top-level paths via pagination`, 'green');
+    return Array.from(allKeys);
+  } catch (error) {
+    log(`❌ Paginated scan failed: ${error.message}`, 'red');
+    return [];
+  }
+}
+
+/**
+ * METHOD 3: Deep scan untuk nested structures (optional)
+ * Cek apakah path memiliki children yang perlu di-expand
+ */
+async function estimatePathSize(dbUrl, token, path) {
+  try {
+    // Coba shallow query dulu
+    const keys = await restApiRequest(dbUrl, path, token, { shallow: 'true' }, 15000);
+    if (keys && typeof keys === 'object') {
+      return Object.keys(keys).length;
+    }
+    return 0;
+  } catch (error) {
+    return -1; // Error/unknown
+  }
+}
+
+/**
+ * Get keys dari path menggunakan method terbaik yang tersedia
+ */
+async function getPathKeys(db, dbUrl, token, path) {
+  try {
+    // Coba REST API shallow dulu (paling efisien)
+    const result = await restApiRequest(dbUrl, path, token, { shallow: 'true' }, 30000);
+    if (result && typeof result === 'object') {
+      return Object.keys(result);
+    }
+    return [];
+  } catch (error) {
+    // Fallback ke Admin SDK dengan pagination
+    const keys = [];
+    try {
+      const snapshot = await db.ref(path).limitToFirst(10000).once('value');
       snapshot.forEach((child) => {
         keys.push(child.key);
         return false;
@@ -185,97 +246,94 @@ async function getKeysOnly(db, dbUrl, token, path) {
   }
 }
 
-// Estimate count dengan shallow query
-async function estimateChildrenCount(dbUrl, token, path) {
-  try {
-    const keys = await getKeysShallow(dbUrl, path, token);
-    return keys.length;
-  } catch (error) {
-    return 0;
-  }
-}
-
-// Get optimal batch size berdasarkan tipe path
+// Get optimal batch size berdasarkan nama path
 function getBatchSize(path) {
-  if (LARGE_PATHS.some(p => path.includes(p))) return 10;  // OHLC 1s/1m: batch kecil
-  if (MEDIUM_PATHS.some(p => path.includes(p))) return 25; // OHLC medium: batch medium
-  return 50; // Paths kecil: batch besar
+  const pathLower = path.toLowerCase();
+  if (LARGE_PATHS.some(p => pathLower.includes(p))) return 5;  // Sangat hati-hati
+  if (MEDIUM_PATHS.some(p => pathLower.includes(p))) return 15;
+  return 50;
 }
 
-// Get optimal delay berdasarkan tipe path
+// Get optimal delay
 function getDelay(path) {
-  if (LARGE_PATHS.some(p => path.includes(p))) return 300;  // OHLC 1s/1m: delay besar
-  if (MEDIUM_PATHS.some(p => path.includes(p))) return 150; // OHLC medium: delay medium
-  return 50; // Paths kecil: delay kecil
+  const pathLower = path.toLowerCase();
+  if (LARGE_PATHS.some(p => pathLower.includes(p))) return 500;
+  if (MEDIUM_PATHS.some(p => pathLower.includes(p))) return 200;
+  return 100;
 }
 
-async function deletePathRecursive(db, dbUrl, token, path, maxDepth = 10, currentDepth = 0) {
+async function deletePathRecursive(db, dbUrl, token, path, maxDepth = 15, currentDepth = 0) {
   const indent = '  '.repeat(currentDepth);
   const batchSize = getBatchSize(path);
   const delayMs = getDelay(path);
   
   try {
-    // Try direct delete first (untuk leaf nodes)
+    // Try direct delete untuk leaf nodes
     try {
       await db.ref(path).remove();
       totalDeleted++;
-      log(`${indent}✅ Deleted (direct): ${path}`, 'green');
+      if (currentDepth <= 2) { // Hanya log untuk level atas
+        log(`${indent}✅ Deleted: ${path}`, 'green');
+      }
       return { success: true, method: 'direct', count: 1 };
     } catch (error) {
-      // Kalau error karena size, lanjut ke recursive
       if (!error.message.includes('WRITE_TOO_BIG') && 
           !error.message.includes('too large') &&
           !error.message.includes('413')) {
-        throw error;
+        // Bukan error size, mungkin permission atau network
+        if (currentDepth <= 2) {
+          log(`${indent}⚠️  Direct delete failed: ${error.message}`, 'yellow');
+        }
       }
+      // Lanjut ke recursive
     }
 
     if (currentDepth >= maxDepth) {
       return await deleteInChunks(db, dbUrl, token, path, currentDepth);
     }
 
-    // FIXED: Gunakan REST API shallow untuk get keys
-    const children = await getKeysOnly(db, dbUrl, token, path);
+    // Get children keys
+    const children = await getPathKeys(db, dbUrl, token, path);
     
     if (children.length === 0) {
-      log(`${indent}ℹ️  ${path} is empty`, 'blue');
       return { success: true, method: 'empty', count: 0 };
     }
 
-    log(`${indent}📊 Found ${children.length.toLocaleString()} children in ${path} (batch: ${batchSize}, delay: ${delayMs}ms)`, 'cyan');
-    
+    if (currentDepth <= 2) {
+      log(`${indent}📊 ${path}: ${children.length.toLocaleString()} children`, 'cyan');
+    }
+
     let deletedCount = 0;
+    let lastProgress = 0;
     
     for (let i = 0; i < children.length; i += batchSize) {
       const batch = children.slice(i, i + batchSize);
       
-      const results = await Promise.allSettled(
-        batch.map(async (childKey) => {
-          const childPath = `${path}/${childKey}`;
-          return await deletePathRecursive(db, dbUrl, token, childPath, maxDepth, currentDepth + 1);
-        })
-      );
-      
-      results.forEach((result, idx) => {
-        if (result.status === 'fulfilled' && result.value.success) {
-          deletedCount += result.value.count || 1;
-        } else {
+      // Sequential delete untuk mengurangi beban (bukan Promise.all)
+      for (const childKey of batch) {
+        const childPath = `${path}/${childKey}`;
+        try {
+          const result = await deletePathRecursive(db, dbUrl, token, childPath, maxDepth, currentDepth + 1);
+          if (result.success) {
+            deletedCount += result.count || 1;
+          }
+        } catch (err) {
           totalFailed++;
-          log(`${indent}❌ Failed: ${batch[idx]}`, 'red');
+          if (currentDepth <= 3) {
+            log(`${indent}   ❌ Failed: ${childKey}`, 'red');
+          }
         }
-      });
+      }
       
-      const progress = Math.min(i + batchSize, children.length);
-      const percent = ((progress / children.length) * 100).toFixed(1);
-      
-      // Progress report untuk paths besar
-      if (children.length > 1000 && (i % (batchSize * 10) === 0 || progress === children.length)) {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const rate = deletedCount / elapsed;
-        const eta = ((children.length - progress) / rate) / 60; // dalam menit
-        
-        log(`${indent}⏳ ${path}: ${percent}% (${progress.toLocaleString()}/${children.length.toLocaleString()}) | ` +
-            `ETA: ${eta.toFixed(1)}m | Rate: ${rate.toFixed(1)} nodes/s`, 'cyan');
+      // Progress report untuk paths besar di level atas
+      if (currentDepth <= 2 && children.length > 100) {
+        const progress = Math.min(i + batchSize, children.length);
+        if (progress - lastProgress >= 100 || progress === children.length) {
+          const percent = ((progress / children.length) * 100).toFixed(1);
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+          log(`${indent}⏳ ${path}: ${percent}% (${progress.toLocaleString()}/${children.length.toLocaleString()}) | ${elapsed}s elapsed`, 'cyan');
+          lastProgress = progress;
+        }
       }
       
       await sleep(delayMs);
@@ -284,19 +342,16 @@ async function deletePathRecursive(db, dbUrl, token, path, maxDepth = 10, curren
     // Coba hapus parent setelah children hilang
     try {
       await db.ref(path).remove();
-      totalDeleted++;
-      log(`${indent}✅ Deleted parent: ${path}`, 'green');
       deletedCount++;
+      totalDeleted++;
     } catch (error) {
-      await sleep(1000);
+      // Parent mungkin sudah terhapus atau memiliki metadata
+      await sleep(500);
       try {
         await db.ref(path).remove();
         totalDeleted++;
-        log(`${indent}✅ Deleted parent (retry): ${path}`, 'green');
-        deletedCount++;
-      } catch (retryError) {
-        totalFailed++;
-        log(`${indent}❌ Failed to delete parent: ${path}`, 'red');
+      } catch (e) {
+        // Ignore
       }
     }
     
@@ -304,61 +359,58 @@ async function deletePathRecursive(db, dbUrl, token, path, maxDepth = 10, curren
     
   } catch (error) {
     totalFailed++;
-    log(`${indent}❌ Error: ${error.message}`, 'red');
+    if (currentDepth <= 2) {
+      log(`${indent}❌ Error at ${path}: ${error.message}`, 'red');
+    }
     return { success: false, error: error.message, count: 0 };
   }
 }
 
 async function deleteInChunks(db, dbUrl, token, path, depth) {
   const indent = '  '.repeat(depth);
-  const batchSize = getBatchSize(path);
   
   try {
-    const keys = await getKeysOnly(db, dbUrl, token, path);
+    const keys = await getPathKeys(db, dbUrl, token, path);
     if (keys.length === 0) return { success: true, method: 'empty', count: 0 };
 
     log(`${indent}🔪 Chunking ${keys.length.toLocaleString()} items at ${path}`, 'magenta');
     
     let deletedCount = 0;
+    const chunkSize = 10; // Very small untuk deep paths
     
-    for (let i = 0; i < keys.length; i += batchSize) {
-      const chunk = keys.slice(i, i + batchSize);
+    for (let i = 0; i < keys.length; i += chunkSize) {
+      const chunk = keys.slice(i, i + chunkSize);
       
-      for (const key of chunk) {
+      await Promise.all(chunk.map(async (key) => {
         try {
           await db.ref(`${path}/${key}`).remove();
           deletedCount++;
           totalDeleted++;
         } catch (error) {
           totalFailed++;
-          log(`${indent}❌ Failed: ${path}/${key}`, 'red');
         }
-        await sleep(50);
+      }));
+      
+      if (i % 100 === 0) {
+        const progress = Math.min(i + chunkSize, keys.length);
+        log(`${indent}   Progress: ${progress.toLocaleString()}/${keys.length.toLocaleString()}`, 'cyan');
       }
       
-      if (i % (batchSize * 5) === 0) {
-        const progress = Math.min(i + batchSize, keys.length);
-        log(`${indent}⏳ Progress: ${progress.toLocaleString()}/${keys.length.toLocaleString()}`, 'cyan');
-      }
-      
-      await sleep(100);
+      await sleep(200);
     }
     
     // Delete parent
     try {
       await db.ref(path).remove();
-      deletedCount++;
       totalDeleted++;
-      log(`${indent}✅ Deleted: ${path}`, 'green');
     } catch (error) {
-      log(`${indent}⚠️  Could not delete parent: ${error.message}`, 'yellow');
+      // Ignore
     }
     
     return { success: true, method: 'chunked', count: deletedCount };
     
   } catch (error) {
     totalFailed++;
-    log(`${indent}❌ Chunk deletion error: ${error.message}`, 'red');
     return { success: false, error: error.message, count: 0 };
   }
 }
@@ -366,50 +418,67 @@ async function deleteInChunks(db, dbUrl, token, path, depth) {
 async function deleteAllData(db, dbUrl, token) {
   try {
     log('\n' + '='.repeat(70), 'cyan');
-    log('🚀 STARTING TARGETED DATABASE CLEANUP', 'bold');
-    log('='.repeat(70), 'cyan');
-    log('⚠️  This will DELETE ALL DATA in predefined paths', 'red');
+    log('🚀 STARTING DYNAMIC DATABASE CLEANUP', 'bold');
+    log('🔍 Mode: Auto-scan all top-level paths', 'blue');
     log('='.repeat(70), 'cyan');
     
-    // Check which paths exist using shallow query (cepat & tidak memory intensive)
-    log('\n📂 Checking which paths exist (using shallow query)...', 'cyan');
+    // STEP 1: Scan semua top-level paths
+    let topLevelKeys = await scanRootShallow(dbUrl, token);
     
-    const existingPaths = [];
-    for (const key of PREDEFINED_PATHS) {
-      process.stdout.write(`   Checking /${key}... `);
-      const count = await estimateChildrenCount(dbUrl, token, `/${key}`);
-      
-      if (count > 0) {
-        existingPaths.push({ key, count });
-        console.log(`${colors.green}EXISTS (${count.toLocaleString()} children)${colors.reset}`);
-      } else {
-        console.log(`${colors.blue}EMPTY/NOT FOUND${colors.reset}`);
-      }
+    // Fallback ke paginated scan kalau shallow gagal
+    if (!topLevelKeys || topLevelKeys.length === 0) {
+      log('⚠️  Trying fallback scan method...', 'yellow');
+      topLevelKeys = await scanRootPaginated(db, 100);
     }
     
-    if (existingPaths.length === 0) {
-      log('\n✅ Database is already empty', 'green');
+    if (topLevelKeys.length === 0) {
+      log('✅ Database appears to be empty (no top-level keys found)', 'green');
       return true;
     }
 
-    log(`\n📊 Summary: ${existingPaths.length} paths to delete`, 'yellow');
-    log('   Priority: Large paths (OHLC 1s/1m) will use small batches\n', 'yellow');
+    log(`\n📋 Discovered ${topLevelKeys.length} top-level paths:`, 'yellow');
     
+    // Sort: kecil dulu, besar belakangan (strategi terbaik)
+    const sortedKeys = topLevelKeys.sort((a, b) => {
+      const aIsLarge = LARGE_PATHS.some(p => a.toLowerCase().includes(p));
+      const bIsLarge = LARGE_PATHS.some(p => b.toLowerCase().includes(p));
+      if (aIsLarge && !bIsLarge) return 1;
+      if (!aIsLarge && bIsLarge) return -1;
+      return a.localeCompare(b);
+    });
+    
+    sortedKeys.forEach((key, idx) => {
+      const isLarge = LARGE_PATHS.some(p => key.toLowerCase().includes(p));
+      const isMedium = MEDIUM_PATHS.some(p => key.toLowerCase().includes(p));
+      let marker = '';
+      if (isLarge) marker = ' [LARGE - Slow]';
+      else if (isMedium) marker = ' [Medium]';
+      else marker = ' [Small - Fast]';
+      
+      log(`   ${idx + 1}. /${key}${marker}`, isLarge ? 'red' : (isMedium ? 'yellow' : 'blue'));
+    });
+    
+    log(`\n⚠️  WARNING: Found ${topLevelKeys.length} paths to delete`, 'red');
+    log('⏱️  Estimated time: Small paths (seconds), OHLC 1s (15-30 mins)\n', 'yellow');
+    
+    await sleep(2000);
+    
+    // STEP 2: Process setiap path
     let successCount = 0;
     
-    for (let i = 0; i < existingPaths.length; i++) {
-      const { key, count } = existingPaths[i];
+    for (let i = 0; i < sortedKeys.length; i++) {
+      const key = sortedKeys[i];
       const path = `/${key}`;
       const pathNum = i + 1;
       
-      log(`\n[${pathNum}/${existingPaths.length}] 🗑️  Processing: ${path} (~${count.toLocaleString()} items)`, 'cyan');
-      log('-'.repeat(70), 'cyan');
+      const isLarge = LARGE_PATHS.some(p => key.toLowerCase().includes(p));
+      const warningColor = isLarge ? 'red' : 'cyan';
       
-      // Warning khusus untuk paths besar
-      if (LARGE_PATHS.includes(key)) {
-        log('   ⚠️  LARGE DATASET DETECTED - This will take time (15-30 mins estimated)', 'yellow');
-        log('   💡 Tips: Jika stuck, restart script -akan melanjutkan dari yang belum terhapus', 'blue');
+      log(`\n[${pathNum}/${sortedKeys.length}] 🗑️  Processing: ${path}`, warningColor);
+      if (isLarge) {
+        log('   ⚠️  LARGE DATASET - Using ultra-conservative settings', 'yellow');
       }
+      log('-'.repeat(70), 'cyan');
       
       let attempts = 0;
       const maxAttempts = 3;
@@ -419,72 +488,66 @@ async function deleteAllData(db, dbUrl, token) {
         attempts++;
         
         if (attempts > 1) {
-          log(`   🔄 Retry attempt ${attempts}/${maxAttempts}`, 'yellow');
-          await sleep(3000);
+          log(`   🔄 Retry attempt ${attempts}/${maxAttempts}...`, 'yellow');
+          await sleep(5000);
         }
         
         try {
           const result = await deletePathRecursive(db, dbUrl, token, path);
           
           if (result.success) {
-            log(`   ✅ Completed: ${path} (${result.count.toLocaleString()} nodes deleted)`, 'green');
+            log(`   ✅ Completed: ${path} (${result.count.toLocaleString()} nodes)`, 'green');
             successCount++;
             success = true;
           } else {
-            log(`   ⚠️  Partial deletion: ${result.error}`, 'yellow');
+            log(`   ⚠️  Partial success for ${path}`, 'yellow');
           }
         } catch (error) {
           log(`   ❌ Attempt ${attempts} failed: ${error.message}`, 'red');
-          
           if (attempts >= maxAttempts) {
-            log(`   ❌ Giving up on ${path} after ${maxAttempts} attempts`, 'red');
+            log(`   ❌ Failed to delete ${path} after ${maxAttempts} attempts`, 'red');
           }
         }
       }
       
-      await sleep(1000);
-      
+      // Summary setelah setiap path
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      const rate = (totalDeleted / parseFloat(elapsed)).toFixed(1);
-      log(`\n📊 Overall: ${pathNum}/${existingPaths.length} paths | ` +
+      const rate = totalDeleted > 0 ? (totalDeleted / parseFloat(elapsed)).toFixed(1) : '0';
+      log(`\n📊 Progress: ${pathNum}/${sortedKeys.length} paths | ` +
           `✅ ${totalDeleted.toLocaleString()} deleted | ❌ ${totalFailed} failed | ` +
           `⏱️  ${elapsed}s | 📈 ${rate} nodes/s`, 'magenta');
+      
+      // Delay antar path untuk database recovery
+      if (i < sortedKeys.length - 1) {
+        await sleep(2000);
+      }
     }
 
+    // Final summary
     const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     
     log('\n' + '='.repeat(70), 'cyan');
     log('🎉 CLEANUP COMPLETED', 'bold');
     log('='.repeat(70), 'cyan');
-    log(`✅ Successfully processed: ${successCount}/${existingPaths.length} paths`, 'green');
+    log(`✅ Successfully processed: ${successCount}/${sortedKeys.length} paths`, 'green');
     log(`✅ Total nodes deleted: ${totalDeleted.toLocaleString()}`, 'green');
     
     if (totalFailed > 0) {
       log(`❌ Total failures: ${totalFailed}`, 'red');
-      log(`⚠️  Some data might remain - re-run script to clean remaining data`, 'yellow');
     }
     
-    log(`⏱️  Total time: ${totalElapsed}s`, 'blue');
+    log(`⏱️  Total time: ${totalElapsed}s (${(totalElapsed/60).toFixed(1)} minutes)`, 'blue');
     log(`📈 Average rate: ${(totalDeleted / parseFloat(totalElapsed)).toFixed(2)} nodes/s`, 'blue');
-    log('='.repeat(70), 'cyan');
     
-    // Verification dengan shallow query
+    // Verification
     log('\n🔍 Verifying cleanup...', 'cyan');
-    let remainingCount = 0;
-    for (const key of PREDEFINED_PATHS) {
-      const count = await estimateChildrenCount(dbUrl, token, `/${key}`);
-      if (count > 0) {
-        remainingCount++;
-        log(`   ⚠️  /${key}: ${count.toLocaleString()} items remaining`, 'yellow');
-      }
-    }
-    
-    if (remainingCount === 0) {
-      log('✅ All predefined paths are now empty!', 'green');
+    const remainingKeys = await scanRootShallow(dbUrl, token);
+    if (!remainingKeys || remainingKeys.length === 0) {
+      log('✅ Database is now empty!', 'green');
       return true;
     } else {
-      log(`⚠️  ${remainingCount} paths still have data`, 'yellow');
-      log('💡 Re-run script to clean remaining data', 'blue');
+      log(`⚠️  ${remainingKeys.length} paths still remain:`, 'yellow');
+      remainingKeys.forEach(key => log(`   - /${key}`, 'yellow'));
       return false;
     }
 
@@ -499,12 +562,16 @@ async function main() {
   try {
     log('\n' + '█'.repeat(70), 'cyan');
     log('█                                                                    █', 'cyan');
-    log('█       REALTIME DATABASE AUTO CLEANUP - FIXED VERSION              █', 'cyan');
-    log('█              (Targeted Paths + REST API Shallow Query)            █', 'cyan');
+    log('█       REALTIME DATABASE AUTO CLEANUP - DYNAMIC SCANNING           █', 'cyan');
+    log('█              (Auto-discovery + Memory Optimized)                  █', 'cyan');
     log('█                                                                    █', 'cyan');
     log('█'.repeat(70), 'cyan');
     
     const { db, token, dbUrl } = await initFirebase();
+    
+    log('\n⚙️  Configuration:', 'blue');
+    log(`   Database: ${dbUrl}`, 'blue');
+    log(`   Memory: ${(require('v8').getHeapStatistics().heap_size_limit / 1024 / 1024).toFixed(0)} MB`, 'blue');
     
     await sleep(1000);
     
@@ -512,30 +579,26 @@ async function main() {
     
     const exitCode = success ? 0 : 1;
     
-    log('\n👋 Cleanup process finished', success ? 'green' : 'yellow');
-    log(`Exit code: ${exitCode}`, success ? 'green' : 'yellow');
-    
-    await sleep(2000);
+    log('\n👋 Process finished', success ? 'green' : 'yellow');
     process.exit(exitCode);
     
   } catch (error) {
-    log(`\n❌ Fatal error in main: ${error.message}`, 'red');
-    log(error.stack, 'red');
+    log(`\n❌ Fatal error: ${error.message}`, 'red');
     process.exit(1);
   }
 }
 
+// Graceful shutdown handlers
 process.on('SIGTERM', async () => {
   log('\n⚠️  SIGTERM received - graceful shutdown...', 'yellow');
-  log(`📊 Progress: ${totalDeleted.toLocaleString()} deleted, ${totalFailed} failed`, 'blue');
-  await sleep(1000);
+  log(`📊 Final stats: ${totalDeleted.toLocaleString()} deleted, ${totalFailed} failed`, 'blue');
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  log('\n⚠️  SIGINT received - graceful shutdown...', 'yellow');
-  log(`📊 Progress: ${totalDeleted.toLocaleString()} deleted, ${totalFailed} failed`, 'blue');
-  await sleep(1000);
+  log('\n⚠️  SIGINT received (Ctrl+C) - stopping...', 'yellow');
+  log(`📊 Progress: ${totalDeleted.toLocaleString()} nodes deleted`, 'blue');
+  log('💡 You can resume by running the script again', 'blue');
   process.exit(0);
 });
 
