@@ -1,4 +1,3 @@
-// trading-simulator/index.js
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -81,14 +80,14 @@ class FirebaseManager {
     };
     
     this.RETENTION_DAYS = {
-      '1s': 0.002778,     // 240 candles (4 menit)
-      '1m': 0.166667,     // 240 candles (4 jam)
-      '5m': 0.833333,     // 240 candles (20 jam)
-      '15m': 2.5,        // 240 candles (2.5 hari)
-      '30m': 5,          // 240 candles (5 hari)
-      '1h': 10,          // 240 candles (10 hari)
-      '4h': 40,          // 240 candles (40 hari)
-      '1d': 240,         // 240 candles (240 hari)
+      '1s': 0.002778,
+      '1m': 0.166667,
+      '5m': 0.833333,
+      '15m': 2.5,
+      '30m': 5,
+      '1h': 10,
+      '4h': 40,
+      '1d': 240,
     };
     
     this.lastCleanupTime = 0;
@@ -338,6 +337,20 @@ class FirebaseManager {
     }
   }
 
+  async getRealtimeDbValue(path) {
+    if (!this.isConnected) {
+      return null;
+    }
+
+    try {
+      const snapshot = await this.realtimeDbAdmin.ref(path).once('value');
+      return snapshot.val();
+    } catch (error) {
+      logger.debug(`Failed to get value at ${path}: ${error.message}`);
+      return null;
+    }
+  }
+
   async setRealtimeValue(path, data, retries = 2) {
     if (!this.isConnected) {
       this.writeStats.failed++;
@@ -430,77 +443,34 @@ class FirebaseManager {
   }
 
   async listenForNewAssets(onNewAsset) {
-  if (!this.isConnected || !this.db) {
-    logger.warn('Firebase not connected, cannot listen for new assets');
-    return;
-  }
+    if (!this.isConnected || !this.db) {
+      logger.warn('Firebase not connected, cannot listen for new assets');
+      return;
+    }
 
-  try {
-    logger.info('Setting up Firestore listener for new assets...');
-    
-    this.db.collection('assets')
-      .where('isActive', '==', true)
-      .where('category', '==', 'normal')
-      .onSnapshot(snapshot => {
-        snapshot.docChanges().forEach(change => {
-          if (change.type === 'added') {
-            const asset = change.doc.data();
-            logger.info(`🔥 Firestore: New asset detected ${asset.symbol}`);
-            onNewAsset({ id: change.doc.id, ...asset });
-          }
+    try {
+      logger.info('Setting up Firestore listener for new assets...');
+      
+      this.db.collection('assets')
+        .where('isActive', '==', true)
+        .where('category', '==', 'normal')
+        .onSnapshot(snapshot => {
+          snapshot.docChanges().forEach(change => {
+            if (change.type === 'added') {
+              const asset = change.doc.data();
+              logger.info(`🔥 Firestore: New asset detected ${asset.symbol}`);
+              onNewAsset({ id: change.doc.id, ...asset });
+            }
+          });
         });
-      });
-      
-    logger.info('Firestore listener active for new assets');
-  } catch (error) {
-    logger.error(`Failed to setup Firestore listener: ${error.message}`);
-  }
-}
-
-  /**
-   * ✅ NEW: Listen for scheduled trends from Realtime Database
-   */
-  // Di index.js simulator, dalam method listenForScheduledTrends
-async listenForScheduledTrends(onTrendReceived) {
-  if (!this.isConnected || !this.realtimeDbAdmin) {
-    this.logger.warn('⚠️ Admin SDK not available, scheduled trends will not work in REST mode');
-    return;
+        
+      logger.info('Firestore listener active for new assets');
+    } catch (error) {
+      logger.error(`Failed to setup Firestore listener: ${error.message}`);
+    }
   }
 
-  try {
-    this.logger.info('Setting up RTDB listener for scheduled trends...');
-    
-    const trendsRef = this.realtimeDbAdmin.ref('_scheduled_trends');
-    
-    trendsRef.on('child_added', (snapshot) => {
-      const normalizedSymbol = snapshot.key; // e.g., "tes"
-      const trendData = snapshot.val();
-      
-      // Cari asset berdasarkan lowercase symbol
-      let targetSimulator = null;
-      for (const [id, simulator] of this.simulators.entries()) {
-        const simSymbol = simulator.asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_');
-        if (simSymbol === normalizedSymbol) {
-          targetSimulator = simulator;
-          break;
-        }
-      }
-      
-      if (targetSimulator && trendData?.isActive) {
-        this.logger.info(`🔥 Scheduled trend received for ${targetSimulator.asset.symbol}: ${trendData.trend}`);
-        targetSimulator.applyScheduledTrend(trendData);
-      } else {
-        this.logger.debug(`Trend received for ${normalizedSymbol} but no simulator found (symbol mismatch)`);
-      }
-    });
-    
-    this.logger.info('✅ Scheduled trends listener active');
-  } catch (error) {
-    this.logger.error(`Failed to setup listener: ${error.message}`);
-  }
-}
-
-async cleanupAsset(asset) {
+  async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
@@ -581,7 +551,7 @@ async cleanupAsset(asset) {
         
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         
-        const expectedBars = tf === '1s' ? 600 : 240; // 10 menit untuk 1s
+        const expectedBars = tf === '1s' ? 600 : 240;
         
         if (totalDeleted > 0) {
           logger.info(
@@ -822,8 +792,6 @@ class AssetSimulator {
     this.lastPriceUpdateTime = 0;
     this.PRICE_UPDATE_INTERVAL = 1000;
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
-
-    // ✅ NEW: Scheduled trend support
     this.scheduledTrend = null;
 
     logger.info('');
@@ -870,29 +838,23 @@ class AssetSimulator {
   }
 
   generatePriceMovement() {
-    // ✅ NEW: Check if there's an active scheduled trend
     if (this.scheduledTrend) {
       const now = Date.now();
       
-      // Check if trend is still active
       if (now >= this.scheduledTrend.startTime && now <= this.scheduledTrend.endTime) {
-        // Apply scheduled trend
         const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
         
-        // Force direction based on trend
         let direction;
         if (this.scheduledTrend.trend === 'buy') {
-          direction = 1;  // Force upward movement
+          direction = 1;
         } else if (this.scheduledTrend.trend === 'sell') {
-          direction = -1; // Force downward movement
+          direction = -1;
         }
         
-        // Increase volatility for more noticeable trend
         const trendVolatilityMultiplier = 2.0;
         const priceChange = this.currentPrice * volatility * direction * trendVolatilityMultiplier;
         let newPrice = this.currentPrice + priceChange;
         
-        // Still respect min/max boundaries
         if (newPrice < this.minPrice) {
           newPrice = this.minPrice;
           logger.debug(`[${this.asset.symbol}] Scheduled trend hit min price ${this.minPrice}`);
@@ -905,13 +867,11 @@ class AssetSimulator {
         this.lastDirection = direction;
         return newPrice;
       } else {
-        // Trend expired, clear it
         logger.info(`[${this.asset.symbol}] Scheduled trend expired, reverting to normal`);
         this.scheduledTrend = null;
       }
     }
     
-    // Normal price generation (no scheduled trend)
     const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
     
     let direction = Math.random() < 0.5 ? -1 : 1;
@@ -1070,13 +1030,9 @@ class AssetSimulator {
     logger.info(`[${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice}`);
   }
 
-  /**
-   * ✅ NEW: Apply scheduled trend from backend
-   */
   applyScheduledTrend(trendData) {
     const now = Date.now();
     
-    // Check if trend is still active
     if (now < trendData.startTime || now > trendData.endTime) {
       logger.info(`[${this.asset.symbol}] Scheduled trend expired or not yet active`);
       this.scheduledTrend = null;
@@ -1098,7 +1054,6 @@ class AssetSimulator {
     logger.info(`[${this.asset.symbol}] ✅ Scheduled trend applied: ${trendData.trend} (${trendData.timeframe})`);
     logger.info(`[${this.asset.symbol}] 📅 Active for ${remainingSeconds}s (until ${new Date(trendData.endTime).toLocaleTimeString()})`);
     
-    // Set timeout to clear trend when it expires
     setTimeout(() => {
       if (this.scheduledTrend && this.scheduledTrend.scheduleId === trendData.scheduleId) {
         logger.info(`[${this.asset.symbol}] 🏁 Scheduled trend ${trendData.trend} completed`);
@@ -1241,175 +1196,163 @@ class MultiAssetManager {
   }
 
   async setupFirestoreListener() {
-  await this.firebase.listenForNewAssets(async (asset) => {
-    if (this.simulators.has(asset.id)) {
-      return; // Asset sudah ada
-    }
-    
-    logger.info(`🆕 Auto-adding new asset from Firestore: ${asset.symbol}`);
-    
-    try {
-      const simulator = new AssetSimulator(asset, this.firebase);
-      await simulator.loadLastPrice();
+    await this.firebase.listenForNewAssets(async (asset) => {
+      if (this.simulators.has(asset.id)) {
+        return;
+      }
       
-      // 🔥 GENERATE 240 CANDLES untuk asset baru
-      await this.initializeCandlesForAsset(asset, simulator);
+      logger.info(`🆕 Auto-adding new asset from Firestore: ${asset.symbol}`);
       
-      this.simulators.set(asset.id, simulator);
-      logger.info(`✅ Asset ${asset.symbol} added and initialized with 240 candles`);
-    } catch (error) {
-      logger.error(`Failed to add new asset ${asset.symbol}: ${error.message}`);
-    }
-  });
-}
+      try {
+        const simulator = new AssetSimulator(asset, this.firebase);
+        await simulator.loadLastPrice();
+        
+        await this.initializeCandlesForAsset(asset, simulator);
+        
+        this.simulators.set(asset.id, simulator);
+        logger.info(`✅ Asset ${asset.symbol} added and initialized with 240 candles`);
+      } catch (error) {
+        logger.error(`Failed to add new asset ${asset.symbol}: ${error.message}`);
+      }
+    });
+  }
 
-/**
- * ✅ NEW: Setup listener for scheduled trends from RTDB
- */
-async setupScheduledTrendListener() {
-  const checkTrends = async () => {
-    try {
-      if (!this.firebase.isConnected) return;
-      
-      // Method untuk fetch data (works untuk REST dan Admin)
-      const trendsData = await this.firebase.getRealtimeDbValue('_scheduled_trends');
-      
-      if (!trendsData) return;
-      
-      Object.entries(trendsData).forEach(([assetSymbol, trendData]) => {
-        // Cari simulator dengan symbol yang match
-        for (const [id, simulator] of this.simulators.entries()) {
-          if (simulator.asset.symbol === assetSymbol && trendData.isActive) {
-            const now = Date.now();
-            if (now >= trendData.startTime && now <= trendData.endTime) {
-              this.logger.info(`📊 Applying trend to ${assetSymbol}`);
-              simulator.applyScheduledTrend(trendData);
+  async setupScheduledTrendListener() {
+    const checkTrends = async () => {
+      try {
+        if (!this.firebase.isConnected) return;
+        
+        const trendsData = await this.firebase.getRealtimeDbValue('_scheduled_trends');
+        
+        if (!trendsData) return;
+        
+        Object.entries(trendsData).forEach(([assetSymbol, trendData]) => {
+          for (const [id, simulator] of this.simulators.entries()) {
+            if (simulator.asset.symbol === assetSymbol && trendData.isActive) {
+              const now = Date.now();
+              if (now >= trendData.startTime && now <= trendData.endTime) {
+                logger.info(`📊 Applying trend to ${assetSymbol}`);
+                simulator.applyScheduledTrend(trendData);
+              }
             }
           }
-        }
-      });
-    } catch (error) {
-      this.logger.debug(`Trend poll error: ${error.message}`);
-    }
-  };
-  
-  // Polling setiap 1 detik (untuk REST mode)
-  setInterval(checkTrends, 1000);
-  this.logger.info('Scheduled trends polling started (1s interval)');
-}
-
-
-async initializeCandlesForAsset(asset, simulator) {
-  const now = TimezoneUtil.getCurrentTimestamp();
-  const initialPrice = simulator.initialPrice;
-  
-  // ✅ ENHANCED: Gunakan volatilitas 10x untuk generating candle history (natural)
-  const VOLATILITY_MULTIPLIER = 10;
-  
-  const originalVolatilityMax = simulator.volatilityMax;
-  const originalVolatilityMin = simulator.volatilityMin;
-  
-  // Kalikan dengan 10 untuk initialization
-  const volatilityMax = originalVolatilityMax * VOLATILITY_MULTIPLIER;
-  const volatilityMin = originalVolatilityMin * VOLATILITY_MULTIPLIER;
-  
-  logger.info(`[${asset.symbol}] Initializing 240 candles with ${VOLATILITY_MULTIPLIER}x volatility:`);
-  logger.info(`[${asset.symbol}]   Original: ${originalVolatilityMin} - ${originalVolatilityMax}`);
-  logger.info(`[${asset.symbol}]   Used: ${volatilityMin} - ${volatilityMax}`);
-  logger.info(`[${asset.symbol}]   Initial Price: ${initialPrice}`);
-  
-  const timeframes = {
-    '1s': 1, '1m': 60, '5m': 300, '15m': 900, 
-    '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
-  };
-  
-  const getVolatilityForTimeframe = (tf) => {
-    if (tf === '1s' || tf === '1m') {
-      return volatilityMin + Math.random() * (volatilityMax - volatilityMin);
-    } else if (tf === '5m' || tf === '15m' || tf === '30m') {
-      const dailyMin = volatilityMin * 10;
-      const dailyMax = volatilityMax * 10;
-      return ((volatilityMin + dailyMin) / 2) + Math.random() * ((volatilityMax + dailyMax) / 2 - (volatilityMin + dailyMin) / 2);
-    } else {
-      return (volatilityMin * 10) + Math.random() * (volatilityMax * 10 - volatilityMin * 10);
-    }
-  };
-  
-  let finalPrice = initialPrice;
-  const assetPath = this.firebase.getAssetPath(asset);
-
-  for (const [tf, duration] of Object.entries(timeframes)) {
-    const candles = {};
-    let price = initialPrice;
-    const volatility = getVolatilityForTimeframe(tf);
+        });
+      } catch (error) {
+        logger.debug(`Trend poll error: ${error.message}`);
+      }
+    };
     
-    for (let i = 239; i >= 0; i--) {
-      const timestamp = now - (i * duration);
-      const open = price;
-      
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      const change = price * volatility * z;
-      
-      let close = open + change;
-      close = Math.max(
-        asset.simulatorSettings?.minPrice ?? initialPrice * 0.5,
-        Math.min(asset.simulatorSettings?.maxPrice ?? initialPrice * 2.0, close)
-      );
-      
-      const high = Math.max(open, close) + Math.abs(change) * Math.random() * 0.5;
-      const low = Math.min(open, close) - Math.abs(change) * Math.random() * 0.5;
-      
-      candles[timestamp] = {
-        timestamp,
-        datetime: TimezoneUtil.formatDateTime(new Date(timestamp * 1000)),
-        datetime_iso: new Date(timestamp * 1000).toISOString(),
-        timezone: 'Asia/Jakarta',
-        open: parseFloat(open.toFixed(6)),
-        high: parseFloat(high.toFixed(6)),
-        low: parseFloat(low.toFixed(6)),
-        close: parseFloat(close.toFixed(6)),
-        volume: Math.floor(1000 + Math.random() * 9000),
-        isCompleted: true
-      };
-      
-      price = close;
-    }
-    
-    const path = `${assetPath}/ohlc_${tf}`;
-    await this.firebase.setRealtimeValue(path, candles);
-    
-    if (tf === '1s') {
-      finalPrice = price;
-    }
-    
-    logger.debug(`[${asset.symbol}] Generated ${tf} candles, final price: ${price.toFixed(6)}`);
+    setInterval(checkTrends, 1000);
+    logger.info('Scheduled trends polling started (1s interval)');
   }
-  
-  // Set current_price ke finalPrice
-  const currentPriceData = {
-    price: parseFloat(finalPrice.toFixed(6)),
-    current: parseFloat(finalPrice.toFixed(6)),
-    timestamp: now,
-    datetime: TimezoneUtil.formatDateTime(new Date(now * 1000)),
-    datetime_iso: new Date(now * 1000).toISOString(),
-    timezone: 'Asia/Jakarta',
-    change: 0
-  };
-  
-  await this.firebase.setRealtimeValue(
-    `${assetPath}/current_price`,
-    currentPriceData
-  );
-  
-  // Update simulator agar melanjutkan dari price terakhir
-  simulator.currentPrice = finalPrice;
-  simulator.isResumed = true;
-  
-  logger.info(`[${asset.symbol}] ✅ 240 candles generated (${VOLATILITY_MULTIPLIER}x volatility).`);
-  logger.info(`[${asset.symbol}]    Current price set to: ${finalPrice.toFixed(6)} (was ${initialPrice.toFixed(6)})`);
-}
+
+  async initializeCandlesForAsset(asset, simulator) {
+    const now = TimezoneUtil.getCurrentTimestamp();
+    const initialPrice = simulator.initialPrice;
+    
+    const VOLATILITY_MULTIPLIER = 10;
+    
+    const originalVolatilityMax = simulator.volatilityMax;
+    const originalVolatilityMin = simulator.volatilityMin;
+    
+    const volatilityMax = originalVolatilityMax * VOLATILITY_MULTIPLIER;
+    const volatilityMin = originalVolatilityMin * VOLATILITY_MULTIPLIER;
+    
+    logger.info(`[${asset.symbol}] Initializing 240 candles with ${VOLATILITY_MULTIPLIER}x volatility:`);
+    logger.info(`[${asset.symbol}]   Original: ${originalVolatilityMin} - ${originalVolatilityMax}`);
+    logger.info(`[${asset.symbol}]   Used: ${volatilityMin} - ${volatilityMax}`);
+    logger.info(`[${asset.symbol}]   Initial Price: ${initialPrice}`);
+    
+    const timeframes = {
+      '1s': 1, '1m': 60, '5m': 300, '15m': 900, 
+      '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400
+    };
+    
+    const getVolatilityForTimeframe = (tf) => {
+      if (tf === '1s' || tf === '1m') {
+        return volatilityMin + Math.random() * (volatilityMax - volatilityMin);
+      } else if (tf === '5m' || tf === '15m' || tf === '30m') {
+        const dailyMin = volatilityMin * 10;
+        const dailyMax = volatilityMax * 10;
+        return ((volatilityMin + dailyMin) / 2) + Math.random() * ((volatilityMax + dailyMax) / 2 - (volatilityMin + dailyMin) / 2);
+      } else {
+        return (volatilityMin * 10) + Math.random() * (volatilityMax * 10 - volatilityMin * 10);
+      }
+    };
+    
+    let finalPrice = initialPrice;
+    const assetPath = this.firebase.getAssetPath(asset);
+
+    for (const [tf, duration] of Object.entries(timeframes)) {
+      const candles = {};
+      let price = initialPrice;
+      const volatility = getVolatilityForTimeframe(tf);
+      
+      for (let i = 239; i >= 0; i--) {
+        const timestamp = now - (i * duration);
+        const open = price;
+        
+        const u1 = Math.random();
+        const u2 = Math.random();
+        const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        const change = price * volatility * z;
+        
+        let close = open + change;
+        close = Math.max(
+          asset.simulatorSettings?.minPrice ?? initialPrice * 0.5,
+          Math.min(asset.simulatorSettings?.maxPrice ?? initialPrice * 2.0, close)
+        );
+        
+        const high = Math.max(open, close) + Math.abs(change) * Math.random() * 0.5;
+        const low = Math.min(open, close) - Math.abs(change) * Math.random() * 0.5;
+        
+        candles[timestamp] = {
+          timestamp,
+          datetime: TimezoneUtil.formatDateTime(new Date(timestamp * 1000)),
+          datetime_iso: new Date(timestamp * 1000).toISOString(),
+          timezone: 'Asia/Jakarta',
+          open: parseFloat(open.toFixed(6)),
+          high: parseFloat(high.toFixed(6)),
+          low: parseFloat(low.toFixed(6)),
+          close: parseFloat(close.toFixed(6)),
+          volume: Math.floor(1000 + Math.random() * 9000),
+          isCompleted: true
+        };
+        
+        price = close;
+      }
+      
+      const path = `${assetPath}/ohlc_${tf}`;
+      await this.firebase.setRealtimeValue(path, candles);
+      
+      if (tf === '1s') {
+        finalPrice = price;
+      }
+      
+      logger.debug(`[${asset.symbol}] Generated ${tf} candles, final price: ${price.toFixed(6)}`);
+    }
+    
+    const currentPriceData = {
+      price: parseFloat(finalPrice.toFixed(6)),
+      current: parseFloat(finalPrice.toFixed(6)),
+      timestamp: now,
+      datetime: TimezoneUtil.formatDateTime(new Date(now * 1000)),
+      datetime_iso: new Date(now * 1000).toISOString(),
+      timezone: 'Asia/Jakarta',
+      change: 0
+    };
+    
+    await this.firebase.setRealtimeValue(
+      `${assetPath}/current_price`,
+      currentPriceData
+    );
+    
+    simulator.currentPrice = finalPrice;
+    simulator.isResumed = true;
+    
+    logger.info(`[${asset.symbol}] ✅ 240 candles generated (${VOLATILITY_MULTIPLIER}x volatility).`);
+    logger.info(`[${asset.symbol}]    Current price set to: ${finalPrice.toFixed(6)} (was ${initialPrice.toFixed(6)})`);
+  }
 
   async start() {
     if (this.isRunning) {
@@ -1428,19 +1371,6 @@ async initializeCandlesForAsset(asset, simulator) {
 
     this.isRunning = true;
 
-    logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v17.1 - 10MIN RETENTION FIX');
-    logger.info('================================================');
-    logger.info(`Normal Assets: ${this.simulators.size}`);
-    logger.info(`Timezone: Asia/Jakarta (WIB = UTC+7)`);
-    logger.info(`Current: ${TimezoneUtil.formatDateTime()}`);
-    logger.info(`Update: 1 second`);
-    logger.info(`Refresh: 10 minutes`);
-    logger.info(`1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE`);
-    logger.info(`Cleanup: Every 1 minute (time-based only)`);
-    logger.info('================================================');
-    logger.info('');
-
     this.updateInterval = setInterval(async () => {
       await this.updateAllPrices();
     }, 1000);
@@ -1451,10 +1381,22 @@ async initializeCandlesForAsset(asset, simulator) {
 
     this.statsInterval = setInterval(() => {
       this.logStats();
-    }, 120000);
+    }, 600000);
 
     this.startHealthCheck();
 
+    logger.info('');
+    logger.info('MULTI-ASSET SIMULATOR v17.1 - 10MIN RETENTION FIX');
+    logger.info('================================================');
+    logger.info(`Normal Assets: ${this.simulators.size}`);
+    logger.info('Timezone: Asia/Jakarta (WIB = UTC+7)');
+    logger.info(`Current: ${TimezoneUtil.formatDateTime()}`);
+    logger.info('Update: 1 second');
+    logger.info('Refresh: 10 minutes');
+    logger.info('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
+    logger.info('Cleanup: Every 1 minute (time-based only)');
+    logger.info('================================================');
+    logger.info('');
     logger.info('All systems running');
   }
 
@@ -1581,8 +1523,8 @@ async function main() {
     }
   }, 300000);
 
-try {
-  const initialized = await firebaseManager.initialize();
+  try {
+    const initialized = await firebaseManager.initialize();
     if (!initialized) {
       logger.error('Firebase initialization failed');
       process.exit(1);
@@ -1590,10 +1532,8 @@ try {
     
     await manager.start();
     
-    // ✅ TAMBAHKAN INI: Setup listener untuk asset baru
     await manager.setupFirestoreListener();
     
-    // ✅ NEW: Setup listener untuk scheduled trends
     await manager.setupScheduledTrendListener();
     
   } catch (error) {
