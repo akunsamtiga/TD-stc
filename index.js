@@ -1,3 +1,4 @@
+// trading-simulator/index.js
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -782,6 +783,10 @@ class AssetSimulator {
     this.volatilityMin = settings.secondVolatilityMin || 0.00001;
     this.volatilityMax = settings.secondVolatilityMax || 0.00008;
     
+    // [PERBAIKAN] Simpan volatility asli untuk reset
+    this.originalVolatilityMin = this.volatilityMin;
+    this.originalVolatilityMax = this.volatilityMax;
+    
     this.lastDirection = 1;
     this.iteration = 0;
     this.lastLogTime = 0;
@@ -793,6 +798,13 @@ class AssetSimulator {
     this.PRICE_UPDATE_INTERVAL = 1000;
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
     this.scheduledTrend = null;
+
+    // [PERBAIKAN] Tambahkan variabel untuk deteksi harga stuck
+    this.stuckCounter = 0;
+    this.lastPriceForStuckCheck = this.currentPrice;
+    this.STUCK_THRESHOLD = 5; // Setelah 5 iterasi harga hampir sama
+    this.stuckBoostActive = false;
+    this.stuckBoostEndTime = 0;
 
     logger.info('');
     logger.info(`Simulator initialized: ${asset.symbol}`);
@@ -822,6 +834,9 @@ class AssetSimulator {
           this.lastPriceData = lastPriceData;
           this.isResumed = true;
           
+          // [PERBAIKAN] Update stuck check price saat resume
+          this.lastPriceForStuckCheck = this.currentPrice;
+          
           logger.info(`[${this.asset.symbol}] RESUMED: ${price.toFixed(6)}`);
           return true;
         } else {
@@ -838,6 +853,14 @@ class AssetSimulator {
   }
 
   generatePriceMovement() {
+    // [PERBAIKAN] Reset stuck boost jika sudah waktunya
+    if (this.stuckBoostActive && Date.now() > this.stuckBoostEndTime) {
+      this.volatilityMin = this.originalVolatilityMin;
+      this.volatilityMax = this.originalVolatilityMax;
+      this.stuckBoostActive = false;
+      logger.debug(`[${this.asset.symbol}] Stuck boost ended, volatility normalized`);
+    }
+
     if (this.scheduledTrend) {
       const now = Date.now();
       
@@ -883,15 +906,19 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
+    // [PERBAIKAN] Bouncing dengan variasi random agar tidak flat
+    const priceRange = this.maxPrice - this.minPrice;
+    const bounceRange = priceRange * 0.02; // 2% dari range
+    
     if (newPrice < this.minPrice) {
-      newPrice = this.minPrice;
+      newPrice = this.minPrice + Math.random() * bounceRange;
       this.lastDirection = 1;
-      logger.debug(`[${this.asset.symbol}] Hit min price ${this.minPrice}, bouncing up`);
+      logger.debug(`[${this.asset.symbol}] Bounced from min: ${newPrice.toFixed(6)}`);
     }
     if (newPrice > this.maxPrice) {
-      newPrice = this.maxPrice;
+      newPrice = this.maxPrice - Math.random() * bounceRange;
       this.lastDirection = -1;
-      logger.debug(`[${this.asset.symbol}] Hit max price ${this.maxPrice}, bouncing down`);
+      logger.debug(`[${this.asset.symbol}] Bounced from max: ${newPrice.toFixed(6)}`);
     }
     
     return newPrice;
@@ -906,6 +933,31 @@ class AssetSimulator {
       }
       
       this.lastPriceUpdateTime = now;
+      
+      // [PERBAIKAN] Deteksi harga stuck
+      const priceDiff = Math.abs(this.currentPrice - this.lastPriceForStuckCheck);
+      const priceDiffPercent = priceDiff / this.currentPrice;
+      
+      if (priceDiffPercent < 0.000001) { // Kurang dari 0.0001% perubahan
+        this.stuckCounter++;
+        
+        if (this.stuckCounter >= this.STUCK_THRESHOLD && !this.stuckBoostActive) {
+          // Aktifkan stuck boost - naikkan volatility sementara
+          this.volatilityMin = this.originalVolatilityMin * 5; // 5x lebih besar
+          this.volatilityMax = this.originalVolatilityMax * 5;
+          this.stuckBoostActive = true;
+          this.stuckBoostEndTime = Date.now() + 5000; // 5 detik
+          
+          logger.info(`[${this.asset.symbol}] ⚠️ PRICE STUCK DETECTED! Boosting volatility 5x for 5s`);
+          
+          // Reset counter
+          this.stuckCounter = 0;
+        }
+      } else {
+        this.stuckCounter = 0;
+      }
+      
+      this.lastPriceForStuckCheck = this.currentPrice;
       
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
@@ -992,8 +1044,9 @@ class AssetSimulator {
 
       if (now - this.lastLogTime > 30000) {
         const pricePosition = ((newPrice - this.minPrice) / (this.maxPrice - this.minPrice) * 100).toFixed(1);
+        const boostIndicator = this.stuckBoostActive ? ' [BOOST]' : '';
         logger.info(
-          `[${this.asset.symbol}] ${this.isResumed ? '' : ''} | ` +
+          `[${this.asset.symbol}]${boostIndicator} | ` +
           `#${this.iteration}: ${newPrice.toFixed(6)} ` +
           `(${pricePosition}% in range ${this.minPrice}-${this.maxPrice})`
         );
@@ -1017,6 +1070,10 @@ class AssetSimulator {
     
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
+    
+    // [PERBAIKAN] Update juga original volatility
+    this.originalVolatilityMin = this.volatilityMin;
+    this.originalVolatilityMax = this.volatilityMax;
     
     if (settings.minPrice !== undefined && settings.minPrice !== null) {
       this.minPrice = settings.minPrice;
@@ -1076,6 +1133,9 @@ class AssetSimulator {
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
       consecutiveErrors: this.consecutiveErrors,
+      // [PERBAIKAN] Tambahkan info stuck detection
+      stuckBoostActive: this.stuckBoostActive,
+      stuckCounter: this.stuckCounter,
     };
   }
 }
@@ -1386,7 +1446,7 @@ class MultiAssetManager {
     this.startHealthCheck();
 
     logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v17.1 - 10MIN RETENTION FIX');
+    logger.info('MULTI-ASSET SIMULATOR v17.2 - STUCK FIX + BOOST');
     logger.info('================================================');
     logger.info(`Normal Assets: ${this.simulators.size}`);
     logger.info('Timezone: Asia/Jakarta (WIB = UTC+7)');
@@ -1395,6 +1455,7 @@ class MultiAssetManager {
     logger.info('Refresh: 10 minutes');
     logger.info('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
     logger.info('Cleanup: Every 1 minute (time-based only)');
+    logger.info('Stuck Detection: ENABLED (5x boost for 5s)');
     logger.info('================================================');
     logger.info('');
     logger.info('All systems running');
@@ -1413,7 +1474,8 @@ class MultiAssetManager {
         price: sim.currentPrice.toFixed(6),
         range: `${sim.minPrice}-${sim.maxPrice}`,
         position: ((sim.currentPrice - sim.minPrice) / (sim.maxPrice - sim.minPrice) * 100).toFixed(1),
-        bars1s: sim.tfManager.barsCreated['1s'] || 0
+        bars1s: sim.tfManager.barsCreated['1s'] || 0,
+        stuckBoost: sim.stuckBoostActive ? 'BOOST' : 'OK'
       });
     }
     
@@ -1428,9 +1490,9 @@ class MultiAssetManager {
     logger.info('');
     
     if (assetInfo.length > 0) {
-      logger.info(`Asset Prices & 1s Bars:`);
+      logger.info(`Asset Prices & Status:`);
       assetInfo.forEach(a => {
-        logger.info(`${a.symbol}: ${a.price} (${a.position}% in ${a.range}) | 1s: ${a.bars1s}`);
+        logger.info(`${a.symbol}: ${a.price} (${a.position}% in ${a.range}) | 1s: ${a.bars1s} | ${a.stuckBoost}`);
       });
       logger.info('');
     }
@@ -1478,7 +1540,7 @@ class MultiAssetManager {
 
 async function main() {
   console.log('');
-  console.log('MULTI-ASSET SIMULATOR v17.1 - 10MIN RETENTION FIX');
+  console.log('MULTI-ASSET SIMULATOR v17.2 - STUCK FIX + BOOST');
   console.log(`Process TZ: ${process.env.TZ}`);
   console.log(`Current Time: ${TimezoneUtil.formatDateTime()}`);
   console.log('1-SECOND TRADING: ENABLED');
@@ -1486,6 +1548,7 @@ async function main() {
   console.log('Cleanup: Time-based ONLY, NO count limit');
   console.log('Crypto: Backend Binance API');
   console.log('Normal: This Simulator');
+  console.log('Stuck Detection: ENABLED (5x boost for 5s)');
   console.log('');
 
   const firebaseManager = new FirebaseManager();
