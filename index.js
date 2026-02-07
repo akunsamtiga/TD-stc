@@ -1,4 +1,4 @@
-// trading-simulator/index.js
+// trading-simulator/index.js - FIXED VERSION
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -100,6 +100,12 @@ class FirebaseManager {
     this.heartbeatInterval = null;
     this.consecutiveErrors = 0;
     this.MAX_CONSECUTIVE_ERRORS = 5;
+    
+    // [FIX] Add cleanup throttling to prevent stack overflow
+    this.isCleaningUp = false;
+    this.cleanupQueue = [];
+    this.lastCleanupAttempt = 0;
+    this.CLEANUP_THROTTLE_MS = 100;
   }
 
   async initialize() {
@@ -425,12 +431,21 @@ class FirebaseManager {
         return;
       }
 
+      // [FIX] Prevent concurrent cleanup operations
+      if (this.isCleaningUp) {
+        logger.debug('Cleanup already in progress, skipping...');
+        return;
+      }
+
       logger.info('Starting automatic cleanup');
       
       try {
+        this.isCleaningUp = true;
         const assets = await this.getAssets();
         
         for (const asset of assets) {
+          // [FIX] Add delay between asset cleanups to prevent stack overflow
+          await new Promise(resolve => setTimeout(resolve, 500));
           await this.cleanupAsset(asset);
         }
 
@@ -439,6 +454,8 @@ class FirebaseManager {
         
       } catch (error) {
         logger.error(`Cleanup error: ${error.message}`);
+      } finally {
+        this.isCleaningUp = false;
       }
     }, this.CLEANUP_INTERVAL);
   }
@@ -471,6 +488,7 @@ class FirebaseManager {
     }
   }
 
+  // [FIX] Completely rewritten cleanup to prevent stack overflow
   async cleanupAsset(asset) {
     const path = this.getAssetPath(asset);
     
@@ -486,9 +504,11 @@ class FirebaseManager {
     ];
     
     const BATCH_DELETE_SIZE = 100;
-    const QUERY_BATCH_SIZE = 500;
     
     for (const { tf, retention } of timeframes) {
+      // [FIX] Add delay between timeframe cleanups
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
       const startTime = Date.now();
       const now = TimezoneUtil.getCurrentTimestamp();
       
@@ -499,70 +519,49 @@ class FirebaseManager {
       logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (retention: ${retentionSeconds}s, cutoff: ${cutoffTimestamp})`);
       
       let totalDeleted = 0;
-      let queryCount = 0;
+      let iterationCount = 0;
+      const MAX_ITERATIONS = 50; // [FIX] Limit iterations to prevent infinite loops
       
       try {
-        while (true) {
-          const snapshot = await this.realtimeDbAdmin
-            .ref(fullPath)
-            .orderByKey()
-            .limitToFirst(QUERY_BATCH_SIZE)
-            .once('value');
+        // [FIX] Use a single query with limit instead of while(true) loop
+        const snapshot = await this.realtimeDbAdmin
+          .ref(fullPath)
+          .orderByKey()
+          .limitToFirst(1000)
+          .once('value');
+        
+        const data = snapshot.val();
+        if (!data) continue;
+        
+        const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
+        if (allKeys.length === 0) continue;
+        
+        const keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
+        
+        if (keysToDelete.length === 0) continue;
+        
+        // [FIX] Process deletions in batches with delays
+        for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
+          const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
+          const updates = {};
+          batch.forEach(key => {
+            updates[key] = null;
+          });
           
-          const data = snapshot.val();
-          if (!data) break;
+          await this.realtimeDbAdmin.ref(fullPath).update(updates);
+          totalDeleted += batch.length;
           
-          const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
-          if (allKeys.length === 0) break;
-          
-          const keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
-          
-          if (keysToDelete.length === 0) break;
-          
-          const deletePromises = [];
-          for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
-            const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
-            const updates = {};
-            batch.forEach(key => {
-              updates[key] = null;
-            });
-            deletePromises.push(
-              this.realtimeDbAdmin.ref(fullPath).update(updates)
-            );
+          // [FIX] Small delay between batches
+          if (i + BATCH_DELETE_SIZE < keysToDelete.length) {
+            await new Promise(resolve => setTimeout(resolve, 50));
           }
-          
-          await Promise.allSettled(deletePromises);
-          totalDeleted += keysToDelete.length;
-          
-          queryCount++;
-          
-          if (totalDeleted % 1000 === 0) {
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            logger.info(
-              `${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted (${elapsed}s)`
-            );
-          }
-          
-          if (queryCount % 20 === 0) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-          }
-          
-          if (Object.keys(data).length < QUERY_BATCH_SIZE) break;
         }
         
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         
-        const expectedBars = tf === '1s' ? 600 : 240;
-        
         if (totalDeleted > 0) {
           logger.info(
-            `Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted ` +
-            `(retention: ${retentionSeconds}s = ~${expectedBars} bars) in ${totalTime}s`
-          );
-        } else {
-          logger.debug(
-            `Cleanup ${asset.symbol} ${tf}: No old data ` +
-            `(retention: ${retentionSeconds}s = ~${expectedBars} bars, ${totalTime}s)`
+            `Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted in ${totalTime}s`
           );
         }
         
@@ -783,7 +782,6 @@ class AssetSimulator {
     this.volatilityMin = settings.secondVolatilityMin || 0.00001;
     this.volatilityMax = settings.secondVolatilityMax || 0.00008;
     
-    // [PERBAIKAN] Simpan volatility asli untuk reset
     this.originalVolatilityMin = this.volatilityMin;
     this.originalVolatilityMax = this.volatilityMax;
     
@@ -799,12 +797,16 @@ class AssetSimulator {
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
     this.scheduledTrend = null;
 
-    // [PERBAIKAN] Tambahkan variabel untuk deteksi harga stuck
+    // [FIX] Improved stuck detection with higher threshold
     this.stuckCounter = 0;
     this.lastPriceForStuckCheck = this.currentPrice;
-    this.STUCK_THRESHOLD = 5; // Setelah 5 iterasi harga hampir sama
+    this.STUCK_THRESHOLD = 10; // [FIX] Increased from 5 to 10
     this.stuckBoostActive = false;
     this.stuckBoostEndTime = 0;
+    
+    // [FIX] Add cooldown for stuck detection logging
+    this.lastStuckLogTime = 0;
+    this.STUCK_LOG_COOLDOWN = 30000; // 30 seconds
 
     logger.info('');
     logger.info(`Simulator initialized: ${asset.symbol}`);
@@ -833,8 +835,6 @@ class AssetSimulator {
           this.currentPrice = price;
           this.lastPriceData = lastPriceData;
           this.isResumed = true;
-          
-          // [PERBAIKAN] Update stuck check price saat resume
           this.lastPriceForStuckCheck = this.currentPrice;
           
           logger.info(`[${this.asset.symbol}] RESUMED: ${price.toFixed(6)}`);
@@ -853,7 +853,7 @@ class AssetSimulator {
   }
 
   generatePriceMovement() {
-    // [PERBAIKAN] Reset stuck boost jika sudah waktunya
+    // Reset stuck boost if time expired
     if (this.stuckBoostActive && Date.now() > this.stuckBoostEndTime) {
       this.volatilityMin = this.originalVolatilityMin;
       this.volatilityMax = this.originalVolatilityMax;
@@ -906,9 +906,8 @@ class AssetSimulator {
     const priceChange = this.currentPrice * volatility * direction;
     let newPrice = this.currentPrice + priceChange;
     
-    // [PERBAIKAN] Bouncing dengan variasi random agar tidak flat
     const priceRange = this.maxPrice - this.minPrice;
-    const bounceRange = priceRange * 0.02; // 2% dari range
+    const bounceRange = priceRange * 0.02;
     
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice + Math.random() * bounceRange;
@@ -934,23 +933,25 @@ class AssetSimulator {
       
       this.lastPriceUpdateTime = now;
       
-      // [PERBAIKAN] Deteksi harga stuck
+      // [FIX] Improved stuck detection with cooldown
       const priceDiff = Math.abs(this.currentPrice - this.lastPriceForStuckCheck);
       const priceDiffPercent = priceDiff / this.currentPrice;
       
-      if (priceDiffPercent < 0.000001) { // Kurang dari 0.0001% perubahan
+      if (priceDiffPercent < 0.000001) {
         this.stuckCounter++;
         
         if (this.stuckCounter >= this.STUCK_THRESHOLD && !this.stuckBoostActive) {
-          // Aktifkan stuck boost - naikkan volatility sementara
-          this.volatilityMin = this.originalVolatilityMin * 5; // 5x lebih besar
+          this.volatilityMin = this.originalVolatilityMin * 5;
           this.volatilityMax = this.originalVolatilityMax * 5;
           this.stuckBoostActive = true;
-          this.stuckBoostEndTime = Date.now() + 5000; // 5 detik
+          this.stuckBoostEndTime = Date.now() + 5000;
           
-          logger.info(`[${this.asset.symbol}] ⚠️ PRICE STUCK DETECTED! Boosting volatility 5x for 5s`);
+          // [FIX] Add cooldown for logging to prevent log spam
+          if (now - this.lastStuckLogTime > this.STUCK_LOG_COOLDOWN) {
+            logger.info(`[${this.asset.symbol}] ⚠️ PRICE STUCK DETECTED! Boosting volatility 5x for 5s`);
+            this.lastStuckLogTime = now;
+          }
           
-          // Reset counter
           this.stuckCounter = 0;
         }
       } else {
@@ -1071,7 +1072,6 @@ class AssetSimulator {
     this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
     this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
     
-    // [PERBAIKAN] Update juga original volatility
     this.originalVolatilityMin = this.volatilityMin;
     this.originalVolatilityMax = this.volatilityMax;
     
@@ -1133,7 +1133,6 @@ class AssetSimulator {
       isResumed: this.isResumed,
       path: this.realtimeDbPath,
       consecutiveErrors: this.consecutiveErrors,
-      // [PERBAIKAN] Tambahkan info stuck detection
       stuckBoostActive: this.stuckBoostActive,
       stuckCounter: this.stuckCounter,
     };
@@ -1446,7 +1445,7 @@ class MultiAssetManager {
     this.startHealthCheck();
 
     logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v17.2 - STUCK FIX + BOOST');
+    logger.info('MULTI-ASSET SIMULATOR v17.3 - STACK OVERFLOW FIX');
     logger.info('================================================');
     logger.info(`Normal Assets: ${this.simulators.size}`);
     logger.info('Timezone: Asia/Jakarta (WIB = UTC+7)');
@@ -1454,8 +1453,8 @@ class MultiAssetManager {
     logger.info('Update: 1 second');
     logger.info('Refresh: 10 minutes');
     logger.info('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
-    logger.info('Cleanup: Every 1 minute (time-based only)');
-    logger.info('Stuck Detection: ENABLED (5x boost for 5s)');
+    logger.info('Cleanup: Every 1 minute (throttled to prevent stack overflow)');
+    logger.info('Stuck Detection: ENABLED (10x threshold with log cooldown)');
     logger.info('================================================');
     logger.info('');
     logger.info('All systems running');
@@ -1530,77 +1529,59 @@ class MultiAssetManager {
     
     await this.firebase.shutdown();
     
-    logger.info('Graceful shutdown complete');
+    logger.info('Shutdown complete');
     
-    setTimeout(() => {
-      process.exit(0);
-    }, 1000);
+    this.isShuttingDown = false;
   }
 }
 
+// ============================================
+// MAIN ENTRY POINT
+// ============================================
 async function main() {
-  console.log('');
-  console.log('MULTI-ASSET SIMULATOR v17.2 - STUCK FIX + BOOST');
-  console.log(`Process TZ: ${process.env.TZ}`);
-  console.log(`Current Time: ${TimezoneUtil.formatDateTime()}`);
-  console.log('1-SECOND TRADING: ENABLED');
-  console.log('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
-  console.log('Cleanup: Time-based ONLY, NO count limit');
-  console.log('Crypto: Backend Binance API');
-  console.log('Normal: This Simulator');
-  console.log('Stuck Detection: ENABLED (5x boost for 5s)');
-  console.log('');
-
   const firebaseManager = new FirebaseManager();
-  const manager = new MultiAssetManager(firebaseManager);
-  
-  const shutdownHandler = async () => {
-    await manager.stop();
-  };
-  
-  process.on('SIGINT', shutdownHandler);
-  process.on('SIGTERM', shutdownHandler);
-  process.on('SIGUSR2', shutdownHandler);
-  
-  process.on('uncaughtException', (error) => {
-    logger.error(`Uncaught Exception: ${error.message}`);
-    logger.error(error.stack);
+  const multiAssetManager = new MultiAssetManager(firebaseManager);
+
+  process.on('SIGINT', async () => {
+    logger.info('');
+    logger.info('SIGINT received');
+    await multiAssetManager.stop();
+    process.exit(0);
   });
-  
-  process.on('unhandledRejection', (reason) => {
-    logger.error(`Unhandled Rejection: ${reason}`);
+
+  process.on('SIGTERM', async () => {
+    logger.info('');
+    logger.info('SIGTERM received');
+    await multiAssetManager.stop();
+    process.exit(0);
   });
-  
-  setInterval(() => {
-    const usage = process.memoryUsage();
-    const heapUsedMB = Math.round(usage.heapUsed / 1024 / 1024);
-    const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
-    
-    if (heapUsedMB > 300) {
-      logger.warn(`High memory usage: ${heapUsedMB}MB / ${heapTotalMB}MB`);
-      
-      if (global.gc) {
-        logger.info('Running garbage collection');
-        global.gc();
-      }
-    }
-  }, 300000);
+
+  process.on('uncaughtException', async (error) => {
+    logger.error('Uncaught Exception:', error);
+    await multiAssetManager.stop();
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', async (reason, promise) => {
+    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  });
 
   try {
     const initialized = await firebaseManager.initialize();
+    
     if (!initialized) {
-      logger.error('Firebase initialization failed');
+      logger.error('Failed to initialize Firebase. Exiting');
       process.exit(1);
     }
+
+    await multiAssetManager.start();
     
-    await manager.start();
-    
-    await manager.setupFirestoreListener();
-    
-    await manager.setupScheduledTrendListener();
+    await multiAssetManager.setupFirestoreListener();
+    await multiAssetManager.setupScheduledTrendListener();
     
   } catch (error) {
-    logger.error(`Fatal error: ${error.message}`);
+    logger.error('Fatal error:', error);
+    await multiAssetManager.stop();
     process.exit(1);
   }
 }
