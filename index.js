@@ -1,4 +1,3 @@
-// trading-simulator/index.js - FIXED VERSION
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';
@@ -879,15 +878,27 @@ class AssetSimulator {
       if (now >= this.scheduledTrend.startTime && now <= this.scheduledTrend.endTime) {
         const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
         
-        let direction;
+        // [FIX] Gunakan bias probabilistik seperti mode normal, bukan forced direction 100%
+        // Buy trend: 80% naik, 20% turun — organik tapi tetap trending ke atas
+        // Sell trend: 80% turun, 20% naik — organik tapi tetap trending ke bawah
+        let trendBias;
         if (this.scheduledTrend.trend === 'buy') {
-          direction = 1;
-        } else if (this.scheduledTrend.trend === 'sell') {
-          direction = -1;
+          trendBias = 0.80; // 80% peluang naik
+        } else {
+          trendBias = 0.20; // 20% peluang naik (= 80% turun)
         }
         
-        const trendVolatilityMultiplier = 2.0;
-        const priceChange = this.currentPrice * volatility * direction * trendVolatilityMultiplier;
+        let direction;
+        if (Math.random() < trendBias) {
+          direction = 1;
+        } else {
+          direction = -1;
+        }
+        // Tetap simpan lastDirection agar transisi ke normal mode mulus
+        this.lastDirection = direction;
+        
+        // [FIX] Hapus trendVolatilityMultiplier 2.0 agar volatility sama seperti mode normal
+        const priceChange = this.currentPrice * volatility * direction;
         let newPrice = this.currentPrice + priceChange;
         
         if (newPrice < this.minPrice) {
@@ -899,7 +910,6 @@ class AssetSimulator {
           logger.debug(`[${this.asset.symbol}] Scheduled trend hit max price ${this.maxPrice}`);
         }
         
-        this.lastDirection = direction;
         return newPrice;
       } else {
         logger.info(`[${this.asset.symbol}] Scheduled trend expired, reverting to normal`);
