@@ -392,6 +392,20 @@ class FirebaseManager {
     return false;
   }
 
+  // [FIX] Tambahkan deleteRealtimeValue untuk cleanup expired trends
+  async deleteRealtimeValue(path) {
+    if (!this.isConnected) {
+      return false;
+    }
+    try {
+      await this.realtimeDbAdmin.ref(path).remove();
+      return true;
+    } catch (error) {
+      logger.debug(`Failed to delete value at ${path}: ${error.message}`);
+      return false;
+    }
+  }
+
   async setRealtimeValueAsync(path, data) {
     this.writeStats.queued++;
     this.writeQueue.push({ path, data, addedAt: Date.now() });
@@ -519,8 +533,6 @@ class FirebaseManager {
       logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (retention: ${retentionSeconds}s, cutoff: ${cutoffTimestamp})`);
       
       let totalDeleted = 0;
-      let iterationCount = 0;
-      const MAX_ITERATIONS = 50; // [FIX] Limit iterations to prevent infinite loops
       
       try {
         // [FIX] Use a single query with limit instead of while(true) loop
@@ -1096,6 +1108,14 @@ class AssetSimulator {
       return;
     }
     
+    // [FIX] Cegah menimpa trend aktif yang sama (idempotent check)
+    if (
+      this.scheduledTrend &&
+      this.scheduledTrend.scheduleId === trendData.scheduleId
+    ) {
+      return; // Sudah diterapkan, tidak perlu diulang
+    }
+    
     this.scheduledTrend = {
       trend: trendData.trend,
       timeframe: trendData.timeframe,
@@ -1276,6 +1296,18 @@ class MultiAssetManager {
     });
   }
 
+  // ============================================================
+  // [FIX] setupScheduledTrendListener - PERUBAHAN UTAMA
+  //
+  // Struktur RTDB lama:  _scheduled_trends/{symbol}  (object tunggal)
+  // Struktur RTDB baru:  _scheduled_trends/{symbol}/{scheduleId}  (nested)
+  //
+  // Perubahan:
+  // 1. Loop dua level: symbol → scheduleId → trendData
+  // 2. Cleanup otomatis: hapus trend yang sudah expired dari RTDB
+  //    agar tidak menumpuk memory
+  // 3. Skip trend yang belum aktif (startTime di masa depan)
+  // ============================================================
   async setupScheduledTrendListener() {
     const checkTrends = async () => {
       try {
@@ -1284,25 +1316,58 @@ class MultiAssetManager {
         const trendsData = await this.firebase.getRealtimeDbValue('_scheduled_trends');
         
         if (!trendsData) return;
+
+        const now = Date.now();
         
-        Object.entries(trendsData).forEach(([assetSymbol, trendData]) => {
-          for (const [id, simulator] of this.simulators.entries()) {
-            if (simulator.asset.symbol === assetSymbol && trendData.isActive) {
-              const now = Date.now();
-              if (now >= trendData.startTime && now <= trendData.endTime) {
-                logger.info(`📊 Applying trend to ${assetSymbol}`);
+        // [FIX] Loop dua level: assetSymbol → scheduleId → trendData
+        for (const [assetSymbol, scheduleMap] of Object.entries(trendsData)) {
+
+          // scheduleMap adalah { scheduleId: trendData, ... }
+          if (typeof scheduleMap !== 'object' || scheduleMap === null) continue;
+
+          for (const [scheduleId, trendData] of Object.entries(scheduleMap)) {
+
+            // Validasi struktur data
+            if (!trendData || typeof trendData !== 'object') continue;
+            if (!trendData.isActive) continue;
+            if (!trendData.startTime || !trendData.endTime) continue;
+
+            // [FIX] Hapus expired trends dari RTDB (cleanup otomatis)
+            if (now > trendData.endTime) {
+              logger.debug(`🧹 Cleaning up expired trend: ${assetSymbol}/${scheduleId}`);
+              const normalizedSymbol = assetSymbol.toLowerCase().replace(/[^a-z0-9]/g, '_');
+              await this.firebase.deleteRealtimeValue(
+                `_scheduled_trends/${normalizedSymbol}/${scheduleId}`
+              );
+              continue;
+            }
+
+            // [FIX] Skip trend yang belum waktunya (startTime di masa depan)
+            if (now < trendData.startTime) {
+              logger.debug(`⏳ Trend not yet active: ${assetSymbol}/${scheduleId} starts at ${new Date(trendData.startTime).toLocaleTimeString()}`);
+              continue;
+            }
+
+            // Trend aktif: startTime <= now <= endTime
+            // Cari simulator yang cocok dengan assetSymbol
+            for (const [, simulator] of this.simulators.entries()) {
+              const normalizedSimbol = simulator.asset.symbol.toLowerCase().replace(/[^a-z0-9]/g, '_');
+              const normalizedAsset  = assetSymbol.toLowerCase().replace(/[^a-z0-9]/g, '_');
+
+              if (normalizedSimbol === normalizedAsset) {
+                logger.info(`📊 Applying trend to ${simulator.asset.symbol} [${scheduleId}]`);
                 simulator.applyScheduledTrend(trendData);
               }
             }
           }
-        });
+        }
       } catch (error) {
         logger.debug(`Trend poll error: ${error.message}`);
       }
     };
     
     setInterval(checkTrends, 1000);
-    logger.info('Scheduled trends polling started (1s interval)');
+    logger.info('Scheduled trends polling started (1s interval) - FIXED: per-scheduleId structure');
   }
 
   async initializeCandlesForAsset(asset, simulator) {
@@ -1445,7 +1510,7 @@ class MultiAssetManager {
     this.startHealthCheck();
 
     logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v17.3 - STACK OVERFLOW FIX');
+    logger.info('MULTI-ASSET SIMULATOR v17.4 - SCHEDULE OVERWRITE FIX');
     logger.info('================================================');
     logger.info(`Normal Assets: ${this.simulators.size}`);
     logger.info('Timezone: Asia/Jakarta (WIB = UTC+7)');
@@ -1455,6 +1520,7 @@ class MultiAssetManager {
     logger.info('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
     logger.info('Cleanup: Every 1 minute (throttled to prevent stack overflow)');
     logger.info('Stuck Detection: ENABLED (10x threshold with log cooldown)');
+    logger.info('Scheduled Trend: FIXED - per-scheduleId (no overwrite)');
     logger.info('================================================');
     logger.info('');
     logger.info('All systems running');
