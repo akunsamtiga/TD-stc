@@ -91,7 +91,7 @@ class FirebaseManager {
     };
     
     this.lastCleanupTime = 0;
-    this.CLEANUP_INTERVAL = 60000;
+    this.CLEANUP_INTERVAL = 300000; // [OPT] 5 menit (dari 60s) — hemat 5x download cleanup
     this.firestoreReadCount = 0;
     this.realtimeWriteCount = 0;
     this.lastReadReset = Date.now();
@@ -99,6 +99,9 @@ class FirebaseManager {
     this.heartbeatInterval = null;
     this.consecutiveErrors = 0;
     this.MAX_CONSECUTIVE_ERRORS = 5;
+    
+    // Registry simulator untuk in-memory cleanup tracking
+    this.simulatorRegistry = null; // diset oleh MultiAssetManager
     
     // [FIX] Add cleanup throttling to prevent stack overflow
     this.isCleaningUp = false;
@@ -194,14 +197,23 @@ class FirebaseManager {
 
   startHeartbeat() {
     this.heartbeatInterval = setInterval(async () => {
+      // [OPT] Kalau ada write sukses dalam 2 menit terakhir, koneksi pasti ok
+      // Tidak perlu baca RTDB → hemat download
+      const timeSinceWrite = Date.now() - this.writeStats.lastSuccessTime;
+      if (timeSinceWrite < 120000 && this.writeStats.success > 0) {
+        this.lastHeartbeat = Date.now();
+        this.consecutiveErrors = 0;
+        logger.debug('Heartbeat: skipped (recent write confirms connection)');
+        return;
+      }
+      // Baca RTDB hanya jika tidak ada write dalam 2 menit terakhir
       try {
-        await this.realtimeDbAdmin.ref('/.info/serverTimeOffset').once('value');
+        await this.realtimeDbAdmin.ref('/.info/connected').once('value');
         this.lastHeartbeat = Date.now();
         this.consecutiveErrors = 0;
       } catch (error) {
         logger.warn(`Heartbeat failed: ${error.message}`);
         this.consecutiveErrors++;
-        
         if (this.consecutiveErrors >= 3) {
           await this.handleConnectionError(error);
         }
@@ -457,9 +469,10 @@ class FirebaseManager {
         const assets = await this.getAssets();
         
         for (const asset of assets) {
-          // [FIX] Add delay between asset cleanups to prevent stack overflow
-          await new Promise(resolve => setTimeout(resolve, 500));
-          await this.cleanupAsset(asset);
+          await new Promise(resolve => setTimeout(resolve, 200));
+          // [OPT] Teruskan simulator instance agar cleanup bisa pakai in-memory tracking
+          const simulator = this.simulatorRegistry ? this.simulatorRegistry.get(asset.id) : null;
+          await this.cleanupAsset(asset, simulator);
         }
 
         this.lastCleanupTime = now;
@@ -501,84 +514,89 @@ class FirebaseManager {
     }
   }
 
-  // [FIX] Completely rewritten cleanup to prevent stack overflow
-  async cleanupAsset(asset) {
+  // [OPT] cleanupAsset — in-memory tracking utama, fallback shallow REST
+  // SEBELUM: limitToFirst(1000) = download ~300KB per TF per aset, 8 TF x 10 aset x 1440/min = 3.5GB/hari
+  // SESUDAH: 0 download (in-memory) atau ~2KB/TF (shallow keys only = hemat 98%)
+  async cleanupAsset(asset, simulator = null) {
     const path = this.getAssetPath(asset);
     
     const timeframes = [
-      { tf: '1s', retention: this.RETENTION_DAYS['1s'] },
-      { tf: '1m', retention: this.RETENTION_DAYS['1m'] },
-      { tf: '5m', retention: this.RETENTION_DAYS['5m'] },
-      { tf: '15m', retention: this.RETENTION_DAYS['15m'] },
-      { tf: '30m', retention: this.RETENTION_DAYS['30m'] },
-      { tf: '1h', retention: this.RETENTION_DAYS['1h'] },
-      { tf: '4h', retention: this.RETENTION_DAYS['4h'] },
-      { tf: '1d', retention: this.RETENTION_DAYS['1d'] },
+      { tf: '1s',  retentionSeconds: Math.floor(this.RETENTION_DAYS['1s']  * 86400) },
+      { tf: '1m',  retentionSeconds: Math.floor(this.RETENTION_DAYS['1m']  * 86400) },
+      { tf: '5m',  retentionSeconds: Math.floor(this.RETENTION_DAYS['5m']  * 86400) },
+      { tf: '15m', retentionSeconds: Math.floor(this.RETENTION_DAYS['15m'] * 86400) },
+      { tf: '30m', retentionSeconds: Math.floor(this.RETENTION_DAYS['30m'] * 86400) },
+      { tf: '1h',  retentionSeconds: Math.floor(this.RETENTION_DAYS['1h']  * 86400) },
+      { tf: '4h',  retentionSeconds: Math.floor(this.RETENTION_DAYS['4h']  * 86400) },
+      { tf: '1d',  retentionSeconds: Math.floor(this.RETENTION_DAYS['1d']  * 86400) },
     ];
     
-    const BATCH_DELETE_SIZE = 100;
-    
-    for (const { tf, retention } of timeframes) {
-      // [FIX] Add delay between timeframe cleanups
-      await new Promise(resolve => setTimeout(resolve, 100));
+    for (const { tf, retentionSeconds } of timeframes) {
+      await new Promise(resolve => setTimeout(resolve, 50));
       
-      const startTime = Date.now();
       const now = TimezoneUtil.getCurrentTimestamp();
-      
-      const retentionSeconds = Math.floor(retention * 86400);
-      const cutoffTimestamp = now - retentionSeconds;
+      const cutoff = now - retentionSeconds;
       const fullPath = `${path}/ohlc_${tf}`;
       
-      logger.debug(`Starting cleanup for ${asset.symbol} ${tf} (retention: ${retentionSeconds}s, cutoff: ${cutoffTimestamp})`);
-      
-      let totalDeleted = 0;
-      
       try {
-        // [FIX] Use a single query with limit instead of while(true) loop
-        const snapshot = await this.realtimeDbAdmin
-          .ref(fullPath)
-          .orderByKey()
-          .limitToFirst(1000)
-          .once('value');
-        
-        const data = snapshot.val();
-        if (!data) continue;
-        
-        const allKeys = Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b));
-        if (allKeys.length === 0) continue;
-        
-        const keysToDelete = allKeys.filter(key => parseInt(key) < cutoffTimestamp);
-        
-        if (keysToDelete.length === 0) continue;
-        
-        // [FIX] Process deletions in batches with delays
-        for (let i = 0; i < keysToDelete.length; i += BATCH_DELETE_SIZE) {
-          const batch = keysToDelete.slice(i, i + BATCH_DELETE_SIZE);
-          const updates = {};
-          batch.forEach(key => {
-            updates[key] = null;
-          });
-          
-          await this.realtimeDbAdmin.ref(fullPath).update(updates);
-          totalDeleted += batch.length;
-          
-          // [FIX] Small delay between batches
-          if (i + BATCH_DELETE_SIZE < keysToDelete.length) {
-            await new Promise(resolve => setTimeout(resolve, 50));
+        let keysToDelete = [];
+
+        if (simulator && simulator.writtenTimestamps && simulator.writtenTimestamps[tf]) {
+          // [OPT] Path 1: dari in-memory tracking → 0 RTDB read sama sekali
+          keysToDelete = simulator.getExpiredTimestamps(tf, retentionSeconds).map(String);
+          if (keysToDelete.length > 0) {
+            logger.debug(`Cleanup ${asset.symbol} ${tf}: in-memory (${keysToDelete.length} expired)`);
+          }
+        } else {
+          // [OPT] Path 2 fallback: Shallow REST → keys only, bukan nilai penuh
+          // ~15 byte/key vs ~300 byte/bar penuh = hemat 95%
+          keysToDelete = await this.getShallowExpiredKeys(fullPath, cutoff);
+          if (keysToDelete.length > 0) {
+            logger.debug(`Cleanup ${asset.symbol} ${tf}: shallow fallback (${keysToDelete.length} expired)`);
           }
         }
         
-        const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+        if (keysToDelete.length === 0) continue;
         
-        if (totalDeleted > 0) {
-          logger.info(
-            `Cleanup ${asset.symbol} ${tf}: ${totalDeleted.toLocaleString()} bars deleted in ${totalTime}s`
-          );
-        }
+        // Satu batch update = 1 write operation, bukan N write
+        const updates = {};
+        keysToDelete.forEach(key => { updates[key] = null; });
+        await this.realtimeDbAdmin.ref(fullPath).update(updates);
+        
+        logger.info(`Cleanup ${asset.symbol} ${tf}: ${keysToDelete.length} bars deleted`);
         
       } catch (error) {
         logger.error(`Cleanup error for ${asset.symbol} ${tf}: ${error.message}`);
       }
+    }
+  }
+
+  // [OPT] Shallow read: ambil keys saja via Firebase REST API (?shallow=true)
+  // Response: { "1735000001": true, "1735000002": true, ... } — hanya keys!
+  async getShallowExpiredKeys(fullPath, cutoffTimestamp) {
+    try {
+      const dbUrl = process.env.FIREBASE_REALTIME_DB_URL;
+      if (!dbUrl) return [];
+
+      const tokenResult = await this.realtimeDbAdmin.app.options.credential?.getAccessToken?.();
+      if (!tokenResult?.access_token) {
+        logger.debug('getShallowExpiredKeys: no access token, skipping');
+        return [];
+      }
+
+      const cleanPath = fullPath.startsWith('/') ? fullPath.slice(1) : fullPath;
+      const url = `${dbUrl.replace(/\/$/, '')}/${cleanPath}.json?shallow=true&access_token=${tokenResult.access_token}`;
+
+      const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return [];
+
+      const data = await response.json();
+      if (!data || typeof data !== 'object') return [];
+
+      return Object.keys(data).filter(k => parseInt(k) < cutoffTimestamp);
+    } catch (error) {
+      logger.debug(`Shallow read failed for ${fullPath}: ${error.message}`);
+      return [];
     }
   }
 
@@ -819,6 +837,14 @@ class AssetSimulator {
     this.lastStuckLogTime = 0;
     this.STUCK_LOG_COOLDOWN = 30000; // 30 seconds
 
+    // [OPT] Track timestamps yang ditulis ke RTDB per timeframe
+    // Digunakan oleh FirebaseManager.cleanupAsset() agar tidak perlu baca RTDB saat cleanup
+    this.writtenTimestamps = {
+      '1s': [], '1m': [], '5m': [], '15m': [],
+      '30m': [], '1h': [], '4h': [], '1d': []
+    };
+    this.MAX_TRACKED_TIMESTAMPS = 1500;
+
     logger.info('');
     logger.info(`Simulator initialized: ${asset.symbol}`);
     logger.info(`Name: ${asset.name}`);
@@ -1037,6 +1063,14 @@ class AssetSimulator {
           `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
         );
+
+        // [OPT] Track timestamp yang ditulis untuk cleanup in-memory
+        if (this.writtenTimestamps[tf] && !this.writtenTimestamps[tf].includes(bar.timestamp)) {
+          this.writtenTimestamps[tf].push(bar.timestamp);
+          if (this.writtenTimestamps[tf].length > this.MAX_TRACKED_TIMESTAMPS) {
+            this.writtenTimestamps[tf] = this.writtenTimestamps[tf].slice(-this.MAX_TRACKED_TIMESTAMPS);
+          }
+        }
       }
 
       for (const [tf, bar] of Object.entries(completedBars)) {
@@ -1060,6 +1094,14 @@ class AssetSimulator {
           `${this.realtimeDbPath}/ohlc_${tf}/${bar.timestamp}`,
           barData
         );
+
+        // [OPT] Track completed bar timestamp juga
+        if (this.writtenTimestamps[tf] && !this.writtenTimestamps[tf].includes(bar.timestamp)) {
+          this.writtenTimestamps[tf].push(bar.timestamp);
+          if (this.writtenTimestamps[tf].length > this.MAX_TRACKED_TIMESTAMPS) {
+            this.writtenTimestamps[tf] = this.writtenTimestamps[tf].slice(-this.MAX_TRACKED_TIMESTAMPS);
+          }
+        }
       }
 
       this.currentPrice = newPrice;
@@ -1149,6 +1191,16 @@ class AssetSimulator {
     }, remainingMs);
   }
 
+  // [OPT] Ambil timestamps yang sudah expired untuk cleanup tanpa baca RTDB
+  getExpiredTimestamps(tf, retentionSeconds) {
+    if (!this.writtenTimestamps[tf]) return [];
+    const cutoff = TimezoneUtil.getCurrentTimestamp() - retentionSeconds;
+    const expired = this.writtenTimestamps[tf].filter(ts => ts < cutoff);
+    // Hapus yang expired dari tracking memory
+    this.writtenTimestamps[tf] = this.writtenTimestamps[tf].filter(ts => ts >= cutoff);
+    return expired;
+  }
+
   getInfo() {
     return {
       symbol: this.asset.symbol,
@@ -1208,6 +1260,9 @@ class MultiAssetManager {
         logger.error(`Failed to init ${asset.symbol}: ${error.message}`);
       }
     }
+
+    // [OPT] Daftarkan simulatorRegistry ke FirebaseManager agar cleanup bisa pakai in-memory
+    this.firebase.simulatorRegistry = this.simulators;
 
     logger.info(`${this.simulators.size} simulators initialized`);
     logger.info('Crypto assets: Backend Binance API');
@@ -1520,7 +1575,7 @@ class MultiAssetManager {
     this.startHealthCheck();
 
     logger.info('');
-    logger.info('MULTI-ASSET SIMULATOR v17.4 - SCHEDULE OVERWRITE FIX');
+    logger.info('MULTI-ASSET SIMULATOR v17.5 - OPTIMIZED RTDB COST');
     logger.info('================================================');
     logger.info(`Normal Assets: ${this.simulators.size}`);
     logger.info('Timezone: Asia/Jakarta (WIB = UTC+7)');
@@ -1528,7 +1583,7 @@ class MultiAssetManager {
     logger.info('Update: 1 second');
     logger.info('Refresh: 10 minutes');
     logger.info('1s Retention: 10 minutes (600 detik) ✅ 240 CANDLES SAFE');
-    logger.info('Cleanup: Every 1 minute (throttled to prevent stack overflow)');
+    logger.info('Cleanup: Every 5 minutes (in-memory tracking, shallow REST fallback)');
     logger.info('Stuck Detection: ENABLED (10x threshold with log cooldown)');
     logger.info('Scheduled Trend: FIXED - per-scheduleId (no overwrite)');
     logger.info('================================================');
