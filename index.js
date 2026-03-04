@@ -1,3 +1,4 @@
+// trading-simulator/index.js
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import { createLogger, format, transports } from 'winston';

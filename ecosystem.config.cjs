@@ -1,3 +1,4 @@
+// trading-simulator/ecosystem.config.cjs
 module.exports = {
   apps: [{
     name: 'multi-asset-simulator',
