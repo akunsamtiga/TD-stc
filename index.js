@@ -770,6 +770,20 @@ class TimeframeManager {
     return { completedBars, currentBars };
   }
 
+  // [FIX] Restore a bar from Firebase data into in-memory state
+  restoreBar(tf, barData) {
+    if (!barData || !this.timeframes[tf]) return;
+    this.bars[tf] = {
+      timestamp: barData.timestamp,
+      open:      barData.open,
+      high:      barData.high,
+      low:       barData.low,
+      close:     barData.close,
+      volume:    barData.volume || 0,
+      isCompleted: false,
+    };
+  }
+
   reset() {
     Object.keys(this.timeframes).forEach(tf => {
       this.bars[tf] = null;
@@ -827,16 +841,22 @@ class AssetSimulator {
     this.realtimeDbPath = this.firebase.getAssetPath(asset);
     this.scheduledTrend = null;
 
-    // [FIX] Improved stuck detection with higher threshold
-    this.stuckCounter = 0;
-    this.lastPriceForStuckCheck = this.currentPrice;
-    this.STUCK_THRESHOLD = 10; // [FIX] Increased from 5 to 10
+    // ── Mean Reversion ────────────────────────────────────────────────────
+    // Tarik harga kembali ke tengah range saat sudah terlalu jauh ke tepi.
+    // Semakin jauh dari tengah, semakin kuat tarikannya (proporsional).
+    // MEAN_REVERSION_STRENGTH: 0 = tidak ada, 1 = instant ke tengah.
+    // 0.03 → tarikan lembut ~3% per tick saat di tepi range.
+    this.MEAN_REVERSION_STRENGTH = 0.03;
+
+    // ── Stuck Detection (berbasis window waktu, bukan per-tick) ───────────
+    // Simpan riwayat harga 30 detik terakhir untuk deteksi stuck yang akurat.
+    this.priceHistory     = [];           // [{ ts (ms), price }]
+    this.STUCK_WINDOW_MS  = 30000;        // window 30 detik
+    this.STUCK_RANGE_PCT  = 0.0001;       // stuck jika range < 0.01% dalam window
     this.stuckBoostActive = false;
     this.stuckBoostEndTime = 0;
-    
-    // [FIX] Add cooldown for stuck detection logging
-    this.lastStuckLogTime = 0;
-    this.STUCK_LOG_COOLDOWN = 30000; // 30 seconds
+    this.lastStuckLogTime  = 0;
+    this.STUCK_LOG_COOLDOWN = 30000;
 
     // [OPT] Track timestamps yang ditulis ke RTDB per timeframe
     // Digunakan oleh FirebaseManager.cleanupAsset() agar tidak perlu baca RTDB saat cleanup
@@ -876,6 +896,15 @@ class AssetSimulator {
           this.lastPriceForStuckCheck = this.currentPrice;
           
           logger.info(`[${this.asset.symbol}] RESUMED: ${price.toFixed(6)}`);
+
+          // [FIX] Step 1: Restore in-memory bar state from Firebase so the
+          // first tick after restart continues existing bars (no open-price jump).
+          await this.restoreTimeframeState();
+
+          // [FIX] Step 2: Backfill any candles that are missing due to downtime
+          // so the chart doesn't show a visual gap.
+          await this.backfillMissingCandles(lastPriceData.timestamp);
+
           return true;
         } else {
           logger.warn(`[${this.asset.symbol}] Last price ${price} outside range, resetting to initial`);
@@ -890,8 +919,176 @@ class AssetSimulator {
     }
   }
 
+  // [FIX] Read the current (in-progress) bar for every timeframe from Firebase
+  // and restore it into TimeframeManager so the next live tick continues
+  // exactly where it left off — preventing the open-price jump.
+  async restoreTimeframeState() {
+    const now = TimezoneUtil.getCurrentTimestamp();
+    logger.info(`[${this.asset.symbol}] Restoring timeframe bar state...`);
+
+    for (const [tf, seconds] of Object.entries(this.tfManager.timeframes)) {
+      try {
+        // The current bar's timestamp bucket
+        const currentBarTs = Math.floor(now / seconds) * seconds;
+
+        const snapshot = await this.firebase.realtimeDbAdmin
+          .ref(`${this.realtimeDbPath}/ohlc_${tf}/${currentBarTs}`)
+          .once('value');
+
+        const bar = snapshot.val();
+        if (bar && bar.open !== undefined) {
+          this.tfManager.restoreBar(tf, bar);
+          logger.debug(`[${this.asset.symbol}] Restored ${tf} bar @ ${currentBarTs}: O=${bar.open} C=${bar.close}`);
+        } else {
+          // Bar doesn't exist yet for this period — that's fine,
+          // the next tick will create a new one with open = currentPrice.
+          logger.debug(`[${this.asset.symbol}] No existing ${tf} bar to restore — will create on next tick`);
+        }
+      } catch (error) {
+        logger.warn(`[${this.asset.symbol}] Could not restore ${tf} bar: ${error.message}`);
+      }
+    }
+
+    logger.info(`[${this.asset.symbol}] Timeframe state restore complete`);
+  }
+
+  // [FIX] Generate synthetic candles for the gap between the last known
+  // price timestamp and now.  This fills chart holes caused by downtime
+  // so the frontend never sees a break in the candlestick series.
+  async backfillMissingCandles(lastKnownTimestamp) {
+    const now = TimezoneUtil.getCurrentTimestamp();
+    const gapSeconds = now - lastKnownTimestamp;
+
+    // Only backfill if there is a meaningful gap (> 2 seconds)
+    if (gapSeconds < 2) return;
+
+    // [FIX] Cap backfill at 300 seconds max.
+    // Jika simulator mati lebih dari 5 menit, hanya 300 detik terakhir yang
+    // di-backfill. Ini mencegah loop jutaan iterasi yang bisa timeout/OOM.
+    const MAX_BACKFILL_SECONDS = 300;
+    const effectiveFrom = gapSeconds > MAX_BACKFILL_SECONDS
+      ? now - MAX_BACKFILL_SECONDS
+      : lastKnownTimestamp;
+
+    const effectiveGap = now - effectiveFrom;
+
+    if (gapSeconds > MAX_BACKFILL_SECONDS) {
+      logger.warn(`[${this.asset.symbol}] Gap ${gapSeconds}s > ${MAX_BACKFILL_SECONDS}s cap — backfilling last ${MAX_BACKFILL_SECONDS}s only`);
+    } else {
+      logger.info(`[${this.asset.symbol}] Backfilling ${effectiveGap}s gap (${effectiveFrom} → ${now})`);
+    }
+
+    // Walk price from effectiveFrom to now using simple Brownian motion.
+    // We pre-generate a price series at 1-second resolution so every
+    // timeframe's bars are built from the same consistent price path.
+    const priceSeries = [];   // { ts, price }
+    let walkPrice = this.currentPrice;
+
+    for (let ts = effectiveFrom + 1; ts <= now; ts++) {
+      const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
+      const direction  = Math.random() < 0.5 ? -1 : 1;
+      let next = walkPrice + walkPrice * volatility * direction;
+      next = Math.max(this.minPrice, Math.min(this.maxPrice, next));
+      priceSeries.push({ ts, price: next });
+      walkPrice = next;
+    }
+
+    if (priceSeries.length === 0) return;
+
+    // Update currentPrice to the end of the backfilled walk so the
+    // very first live tick opens from the same price — no jump.
+    this.currentPrice = walkPrice;
+    this.lastPriceForStuckCheck = walkPrice;
+
+    // Now aggregate the 1-second price series into each timeframe's bars
+    for (const [tf, seconds] of Object.entries(this.tfManager.timeframes)) {
+      // Group ticks into bar buckets
+      const barMap = {};  // ts → { open, high, low, close, volume }
+
+      for (const { ts, price } of priceSeries) {
+        const barTs = Math.floor(ts / seconds) * seconds;
+
+        if (!barMap[barTs]) {
+          barMap[barTs] = {
+            open:   price,
+            high:   price,
+            low:    price,
+            close:  price,
+            volume: 0,
+          };
+        } else {
+          barMap[barTs].high   = Math.max(barMap[barTs].high,  price);
+          barMap[barTs].low    = Math.min(barMap[barTs].low,   price);
+          barMap[barTs].close  = price;
+        }
+        barMap[barTs].volume += Math.floor(100 + Math.random() * 900);
+      }
+
+      // The bar that is still open (current bucket) should NOT be
+      // written as isCompleted — let the live ticks handle it instead.
+      const currentBarTs = Math.floor(now / seconds) * seconds;
+
+      const updates = {};
+      let backfilledCount = 0;
+
+      for (const [barTsStr, bar] of Object.entries(barMap)) {
+        const barTs = parseInt(barTsStr);
+        const isCurrentBar = barTs === currentBarTs;
+
+        // Skip the current open bar — already restored (or will be created)
+        // by restoreTimeframeState() above.
+        if (isCurrentBar) continue;
+
+        updates[barTs] = {
+          timestamp:    barTs,
+          datetime:     TimezoneUtil.formatDateTime(new Date(barTs * 1000)),
+          datetime_iso: new Date(barTs * 1000).toISOString(),
+          timezone:     'Asia/Jakarta',
+          open:         parseFloat(bar.open.toFixed(6)),
+          high:         parseFloat(bar.high.toFixed(6)),
+          low:          parseFloat(bar.low.toFixed(6)),
+          close:        parseFloat(bar.close.toFixed(6)),
+          volume:       bar.volume,
+          isCompleted:  true,
+        };
+        backfilledCount++;
+      }
+
+      if (backfilledCount > 0) {
+        await this.firebase.realtimeDbAdmin
+          .ref(`${this.realtimeDbPath}/ohlc_${tf}`)
+          .update(updates);
+
+        // Track timestamps for in-memory cleanup
+        if (this.writtenTimestamps[tf]) {
+          const newTs = Object.keys(updates).map(Number);
+          this.writtenTimestamps[tf].push(...newTs);
+          if (this.writtenTimestamps[tf].length > this.MAX_TRACKED_TIMESTAMPS) {
+            this.writtenTimestamps[tf] = this.writtenTimestamps[tf].slice(-this.MAX_TRACKED_TIMESTAMPS);
+          }
+        }
+
+        logger.info(`[${this.asset.symbol}] Backfilled ${backfilledCount} ${tf} candles`);
+      }
+    }
+
+    // Update current_price to the end of the backfilled walk
+    const lastTs = priceSeries[priceSeries.length - 1].ts;
+    const priceData = {
+      price:        parseFloat(walkPrice.toFixed(6)),
+      timestamp:    lastTs,
+      datetime:     TimezoneUtil.formatDateTime(new Date(lastTs * 1000)),
+      datetime_iso: new Date(lastTs * 1000).toISOString(),
+      timezone:     'Asia/Jakarta',
+      change:       parseFloat(((walkPrice - this.initialPrice) / this.initialPrice * 100).toFixed(2)),
+    };
+    await this.firebase.setRealtimeValue(`${this.realtimeDbPath}/current_price`, priceData);
+
+    logger.info(`[${this.asset.symbol}] Backfill complete. Price advanced: ${this.lastPriceData.price.toFixed(6)} → ${walkPrice.toFixed(6)}`);
+  }
+
   generatePriceMovement() {
-    // Reset stuck boost if time expired
+    // ── Reset stuck boost jika sudah expired ──────────────────────────────
     if (this.stuckBoostActive && Date.now() > this.stuckBoostEndTime) {
       this.volatilityMin = this.originalVolatilityMin;
       this.volatilityMax = this.originalVolatilityMax;
@@ -899,65 +1096,53 @@ class AssetSimulator {
       logger.debug(`[${this.asset.symbol}] Stuck boost ended, volatility normalized`);
     }
 
+    const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
+    const priceRange  = this.maxPrice - this.minPrice;
+    const midPrice    = this.minPrice + priceRange / 2;
+    const bounceRange = priceRange * 0.02;
+
+    // ── [FIX 1] Mean Reversion ────────────────────────────────────────────
+    // deviation: -1 = di minPrice, 0 = di tengah, +1 = di maxPrice
+    // reversionPull: tarikan berlawanan arah — makin tepi makin kuat
+    const deviation     = (this.currentPrice - midPrice) / (priceRange / 2);
+    const reversionPull = -deviation * this.MEAN_REVERSION_STRENGTH;
+
+    // ── Scheduled Trend ───────────────────────────────────────────────────
     if (this.scheduledTrend) {
       const now = Date.now();
-      
+
       if (now >= this.scheduledTrend.startTime && now <= this.scheduledTrend.endTime) {
-        const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
-        
-        // [FIX] Gunakan bias probabilistik seperti mode normal, bukan forced direction 100%
-        // Buy trend: 80% naik, 20% turun — organik tapi tetap trending ke atas
-        // Sell trend: 80% turun, 20% naik — organik tapi tetap trending ke bawah
-        let trendBias;
-        if (this.scheduledTrend.trend === 'buy') {
-          trendBias = 0.80; // 80% peluang naik
-        } else {
-          trendBias = 0.20; // 20% peluang naik (= 80% turun)
-        }
-        
-        let direction;
-        if (Math.random() < trendBias) {
-          direction = 1;
-        } else {
-          direction = -1;
-        }
-        // Tetap simpan lastDirection agar transisi ke normal mode mulus
+        // Bias probabilistik: buy=80% naik, sell=80% turun
+        const trendBias = this.scheduledTrend.trend === 'buy' ? 0.80 : 0.20;
+        const direction = Math.random() < trendBias ? 1 : -1;
         this.lastDirection = direction;
-        
-        // [FIX] Hapus trendVolatilityMultiplier 2.0 agar volatility sama seperti mode normal
-        const priceChange = this.currentPrice * volatility * direction;
-        let newPrice = this.currentPrice + priceChange;
-        
-        if (newPrice < this.minPrice) {
-          newPrice = this.minPrice;
-          logger.debug(`[${this.asset.symbol}] Scheduled trend hit min price ${this.minPrice}`);
-        }
-        if (newPrice > this.maxPrice) {
-          newPrice = this.maxPrice;
-          logger.debug(`[${this.asset.symbol}] Scheduled trend hit max price ${this.maxPrice}`);
-        }
-        
+
+        const rawChange   = this.currentPrice * volatility * direction;
+        // Mean reversion tetap aktif saat trend agar tidak tembus boundary
+        const revertDelta = this.currentPrice * Math.abs(volatility) * reversionPull;
+        let newPrice = this.currentPrice + rawChange + revertDelta;
+
+        newPrice = Math.max(this.minPrice, Math.min(this.maxPrice, newPrice));
         return newPrice;
       } else {
         logger.info(`[${this.asset.symbol}] Scheduled trend expired, reverting to normal`);
         this.scheduledTrend = null;
       }
     }
-    
-    const volatility = this.volatilityMin + Math.random() * (this.volatilityMax - this.volatilityMin);
-    
+
+    // ── Normal Mode ───────────────────────────────────────────────────────
+    // Momentum: 70% ikuti arah sebelumnya, 30% acak
     let direction = Math.random() < 0.5 ? -1 : 1;
     if (Math.random() < 0.7) {
       direction = this.lastDirection;
     }
     this.lastDirection = direction;
-    
-    const priceChange = this.currentPrice * volatility * direction;
-    let newPrice = this.currentPrice + priceChange;
-    
-    const priceRange = this.maxPrice - this.minPrice;
-    const bounceRange = priceRange * 0.02;
-    
+
+    const rawChange   = this.currentPrice * volatility * direction;
+    // [FIX 1] Tambahkan mean reversion ke perubahan harga
+    const revertDelta = this.currentPrice * Math.abs(volatility) * reversionPull;
+    let newPrice = this.currentPrice + rawChange + revertDelta;
+
     if (newPrice < this.minPrice) {
       newPrice = this.minPrice + Math.random() * bounceRange;
       this.lastDirection = 1;
@@ -968,7 +1153,7 @@ class AssetSimulator {
       this.lastDirection = -1;
       logger.debug(`[${this.asset.symbol}] Bounced from max: ${newPrice.toFixed(6)}`);
     }
-    
+
     return newPrice;
   }
 
@@ -981,33 +1166,41 @@ class AssetSimulator {
       }
       
       this.lastPriceUpdateTime = now;
-      
-      // [FIX] Improved stuck detection with cooldown
-      const priceDiff = Math.abs(this.currentPrice - this.lastPriceForStuckCheck);
-      const priceDiffPercent = priceDiff / this.currentPrice;
-      
-      if (priceDiffPercent < 0.000001) {
-        this.stuckCounter++;
-        
-        if (this.stuckCounter >= this.STUCK_THRESHOLD && !this.stuckBoostActive) {
-          this.volatilityMin = this.originalVolatilityMin * 5;
-          this.volatilityMax = this.originalVolatilityMax * 5;
-          this.stuckBoostActive = true;
-          this.stuckBoostEndTime = Date.now() + 5000;
-          
-          // [FIX] Add cooldown for logging to prevent log spam
+
+      // ── [FIX 2] Stuck Detection berbasis window waktu ───────────────────
+      // Simpan harga ke history, pangkas entry yang sudah di luar window.
+      this.priceHistory.push({ ts: now, price: this.currentPrice });
+      const windowStart = now - this.STUCK_WINDOW_MS;
+      this.priceHistory = this.priceHistory.filter(e => e.ts >= windowStart);
+
+      // Baru cek stuck jika sudah ada cukup data (minimal setengah window)
+      if (
+        this.priceHistory.length >= 10 &&
+        this.priceHistory[0].ts <= now - this.STUCK_WINDOW_MS / 2
+      ) {
+        const prices   = this.priceHistory.map(e => e.price);
+        const hi       = Math.max(...prices);
+        const lo       = Math.min(...prices);
+        const rangePct = (hi - lo) / this.currentPrice;
+
+        if (rangePct < this.STUCK_RANGE_PCT && !this.stuckBoostActive) {
+          this.volatilityMin     = this.originalVolatilityMin * 5;
+          this.volatilityMax     = this.originalVolatilityMax * 5;
+          this.stuckBoostActive  = true;
+          this.stuckBoostEndTime = now + 10000; // boost 10 detik
+
           if (now - this.lastStuckLogTime > this.STUCK_LOG_COOLDOWN) {
-            logger.info(`[${this.asset.symbol}] ⚠️ PRICE STUCK DETECTED! Boosting volatility 5x for 5s`);
+            logger.info(
+              `[${this.asset.symbol}] ⚠️ PRICE STUCK DETECTED! ` +
+              `Range ${(rangePct * 100).toFixed(5)}% in ${this.STUCK_WINDOW_MS / 1000}s window. ` +
+              `Boosting volatility 5x for 10s`
+            );
             this.lastStuckLogTime = now;
           }
-          
-          this.stuckCounter = 0;
+          // Reset history agar tidak langsung trigger lagi setelah boost
+          this.priceHistory = [];
         }
-      } else {
-        this.stuckCounter = 0;
       }
-      
-      this.lastPriceForStuckCheck = this.currentPrice;
       
       const timestamp = TimezoneUtil.getCurrentTimestamp();
       const newPrice = this.generatePriceMovement();
@@ -1133,23 +1326,45 @@ class AssetSimulator {
 
   updateSettings(newAsset) {
     const settings = newAsset.simulatorSettings || {};
-    
-    this.volatilityMin = settings.secondVolatilityMin || this.volatilityMin;
-    this.volatilityMax = settings.secondVolatilityMax || this.volatilityMax;
-    
+
+    // [FIX 5] Gunakan ?? bukan || agar nilai 0 tetap diterima
+    this.volatilityMin = settings.secondVolatilityMin ?? this.volatilityMin;
+    this.volatilityMax = settings.secondVolatilityMax ?? this.volatilityMax;
+
     this.originalVolatilityMin = this.volatilityMin;
     this.originalVolatilityMax = this.volatilityMax;
-    
+
+    const prevMin = this.minPrice;
+    const prevMax = this.maxPrice;
+
     if (settings.minPrice !== undefined && settings.minPrice !== null) {
       this.minPrice = settings.minPrice;
     }
     if (settings.maxPrice !== undefined && settings.maxPrice !== null) {
       this.maxPrice = settings.maxPrice;
     }
-    
+
+    // [FIX 5] Jika currentPrice di luar range baru, clamp ke dalam range
+    // agar simulator tidak langsung stuck di boundary setelah update.
+    if (this.currentPrice < this.minPrice || this.currentPrice > this.maxPrice) {
+      const clampedPrice = Math.max(this.minPrice, Math.min(this.maxPrice, this.currentPrice));
+      logger.warn(
+        `[${this.asset.symbol}] currentPrice ${this.currentPrice.toFixed(6)} ` +
+        `out of new range [${this.minPrice}, ${this.maxPrice}]. ` +
+        `Clamping to ${clampedPrice.toFixed(6)}`
+      );
+      this.currentPrice = clampedPrice;
+      // Reset history supaya stuck detection tidak false-positive
+      this.priceHistory = [];
+    }
+
     this.asset = newAsset;
-    
-    logger.info(`[${this.asset.symbol}] Settings updated - Range: ${this.minPrice}-${this.maxPrice}`);
+
+    logger.info(
+      `[${this.asset.symbol}] Settings updated — ` +
+      `Range: [${prevMin}→${this.minPrice}, ${prevMax}→${this.maxPrice}] | ` +
+      `Volatility: ${this.volatilityMin}–${this.volatilityMax}`
+    );
   }
 
   applyScheduledTrend(trendData) {
@@ -1217,7 +1432,7 @@ class AssetSimulator {
       path: this.realtimeDbPath,
       consecutiveErrors: this.consecutiveErrors,
       stuckBoostActive: this.stuckBoostActive,
-      stuckCounter: this.stuckCounter,
+      priceHistorySize: this.priceHistory.length,
     };
   }
 }
@@ -1606,8 +1821,7 @@ class MultiAssetManager {
         range: `${sim.minPrice}-${sim.maxPrice}`,
         position: ((sim.currentPrice - sim.minPrice) / (sim.maxPrice - sim.minPrice) * 100).toFixed(1),
         bars1s: sim.tfManager.barsCreated['1s'] || 0,
-        stuckBoost: sim.stuckBoostActive ? 'BOOST' : 'OK'
-      });
+        stuckBoost: sim.stuckBoostActive ? 'BOOST' : 'OK'      });
     }
     
     logger.info('');
