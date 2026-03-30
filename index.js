@@ -436,7 +436,7 @@ class FirebaseManager {
       
       this.isProcessingQueue = true;
       
-      const batch = this.writeQueue.splice(0, 20);
+      const batch = this.writeQueue.splice(0, 50);
       
       await Promise.allSettled(
         batch.map(({ path, data }) => this.setRealtimeValue(path, data, 1))
@@ -446,7 +446,7 @@ class FirebaseManager {
       this.writeQueue = this.writeQueue.filter(item => now - item.addedAt < 300000);
       
       this.isProcessingQueue = false;
-    }, 500);
+    }, 200);
   }
 
   async startCleanupScheduler() {
